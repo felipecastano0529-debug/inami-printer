@@ -22,7 +22,7 @@
   "build": {
     "appId": "com.inami.printer",
     "productName": "Inami Printer",
-    "artifactName": "Inami-Printer-${version}-${arch}.${ext}",
+    "artifactName": "Inami-Printer-${arch}.${ext}",
     "publish": null,
     "files": [
       "dist/**/*",
