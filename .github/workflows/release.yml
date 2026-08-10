@@ -1,17 +1,17 @@
-# Compila Pida Pues Printer para macOS (arm64 + x64) y Windows (x64) y sube
-# los binarios a un release del REPO PÚBLICO felipecastano0529-debug/impresion-
-# Así los empleados pueden descargar sin login en GitHub.
+# Compila Inami Printer para macOS (arm64 + x64) y Windows (x64) y publica los
+# instaladores como release de ESTE repo, que es público: el equipo del local
+# descarga sin cuenta de GitHub.
+#
+# Antes publicaba en otro repo (`impresion-`) con un Personal Access Token,
+# porque el código vivía en un repo privado y los releases tenían que salir a
+# uno público. Este repo YA es público, así que sobra el rodeo y sobra el
+# token: basta el GITHUB_TOKEN que Actions inyecta solo.
 #
 # Cómo se usa:
-#   1. Bumpea la versión en package.json si quieres (ej. 0.1.0 → 0.2.0).
-#   2. Dispara este workflow desde Actions → "Release Printer" → Run workflow,
-#      con el tag que va a tener el release (ej. printer-v0.2.0).
-#   3. El workflow compila los 3 instaladores, crea el release en el repo
-#      público, y sube los binarios. Cuando termina, ya están descargables
-#      desde /app → App impresora.
-#
-# Requiere el secret RELEASES_PAT: un Personal Access Token con permiso
-# `repo` (classic) o `contents:write` sobre el repo público de releases.
+#   1. Sube la versión en package.json si toca.
+#   2. Actions → "Release Printer" → Run workflow, con el tag (ej. v0.5.3).
+#   3. Compila los 3 instaladores y los sube al release. Al terminar ya se
+#      descargan desde /app → App impresora.
 
 name: Release Printer
 
@@ -19,19 +19,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag/versión del release (ej. printer-v0.2.0)"
+        description: "Tag del release (ej. v0.5.3)"
         required: true
-        default: "printer-v0.1.0"
+        default: "v0.5.2"
       release_notes:
         description: "Notas del release (opcional)"
         required: false
         default: "Build automático"
 
-env:
-  RELEASES_REPO: felipecastano0529-debug/impresion-
-
 permissions:
-  contents: read   # solo lectura sobre este repo; al público escribimos con PAT
+  contents: write   # crear el release y subirle los binarios, en este mismo repo
 
 jobs:
   build:
@@ -80,41 +77,41 @@ jobs:
             --${{ matrix.arch }} \
             --publish never
 
-      - name: Ensure release exists in public repo
+      - name: Crear el release si no existe
         # Solo lo intenta el primer job (mac arm64) — los siguientes
         # encuentran el release ya creado y solo suben sus assets.
         if: matrix.arch == 'arm64' && runner.os == 'macOS'
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           TAG="${{ inputs.tag }}"
           NOTES="${{ inputs.release_notes }}"
-          if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
-            echo "Release $TAG ya existe en $RELEASES_REPO — saltando creación."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG ya existe — saltando creación."
           else
-            echo "Creando release $TAG en $RELEASES_REPO…"
+            echo "Creando release $TAG…"
             gh release create "$TAG" \
-              --repo "$RELEASES_REPO" \
-              --title "Pida Pues Printer ${TAG#printer-v}" \
+              \
+              --title "Inami Printer ${TAG#v}" \
               --notes "$NOTES"
           fi
 
       - name: Rename binarios a nombres estables (sin versión)
         # Los empleados descargan vía /releases/latest/download/<file> que
         # apunta al último release. Para que la URL sea fija usamos nombres
-        # SIN número de versión: Pida-Pues-Printer-arm64.dmg, etc.
+        # SIN número de versión: Inami-Printer-arm64.dmg, etc.
         shell: bash
         run: |
           cd release
           ls -la
           if [ "${{ runner.os }}" = "Windows" ]; then
             for f in *.exe; do
-              [ -e "$f" ] && mv "$f" "Pida-Pues-Printer-${{ matrix.arch }}.exe" || true
+              [ -e "$f" ] && mv "$f" "Inami-Printer-${{ matrix.arch }}.exe" || true
             done
           else
             for f in *.dmg; do
-              [ -e "$f" ] && mv "$f" "Pida-Pues-Printer-${{ matrix.arch }}.dmg" || true
+              [ -e "$f" ] && mv "$f" "Inami-Printer-${{ matrix.arch }}.dmg" || true
             done
           fi
           ls -la
@@ -124,21 +121,21 @@ jobs:
         # Los demás esperan hasta que aparezca antes de subir su asset.
         if: matrix.arch != 'arm64' || runner.os != 'macOS'
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           TAG="${{ inputs.tag }}"
           for i in {1..30}; do
-            if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
               echo "Release $TAG listo."; exit 0
             fi
             echo "Esperando release… ($i/30)"; sleep 10
           done
           echo "::error::Release no apareció a tiempo"; exit 1
 
-      - name: Upload artifacts to public release
+      - name: Subir los instaladores al release
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           cd release
@@ -151,7 +148,7 @@ jobs:
             echo "::error::No se encontraron instaladores para subir"; exit 1
           fi
           for f in $FILES; do
-            echo "Subiendo $f a ${RELEASES_REPO}@${{ inputs.tag }}…"
+            echo "Subiendo $f a ${{ inputs.tag }}…"
             gh release upload "${{ inputs.tag }}" "$f" \
-              --repo "$RELEASES_REPO" --clobber
+              --clobber
           done
