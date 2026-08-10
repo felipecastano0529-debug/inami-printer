@@ -1,0 +1,157 @@
+# Compila Pida Pues Printer para macOS (arm64 + x64) y Windows (x64) y sube
+# los binarios a un release del REPO PÚBLICO felipecastano0529-debug/impresion-
+# Así los empleados pueden descargar sin login en GitHub.
+#
+# Cómo se usa:
+#   1. Bumpea la versión en package.json si quieres (ej. 0.1.0 → 0.2.0).
+#   2. Dispara este workflow desde Actions → "Release Printer" → Run workflow,
+#      con el tag que va a tener el release (ej. printer-v0.2.0).
+#   3. El workflow compila los 3 instaladores, crea el release en el repo
+#      público, y sube los binarios. Cuando termina, ya están descargables
+#      desde /app → App impresora.
+#
+# Requiere el secret RELEASES_PAT: un Personal Access Token con permiso
+# `repo` (classic) o `contents:write` sobre el repo público de releases.
+
+name: Release Printer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag/versión del release (ej. printer-v0.2.0)"
+        required: true
+        default: "printer-v0.1.0"
+      release_notes:
+        description: "Notas del release (opcional)"
+        required: false
+        default: "Build automático"
+
+env:
+  RELEASES_REPO: felipecastano0529-debug/impresion-
+
+permissions:
+  contents: read   # solo lectura sobre este repo; al público escribimos con PAT
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14         # arm64 nativo
+            arch: arm64
+            target: dmg
+          - os: macos-13         # intel
+            arch: x64
+            target: dmg
+          - os: windows-latest
+            arch: x64
+            target: nsis
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build TS + renderer
+        run: npm run build
+
+      - name: Package (electron-builder)
+        # bash explícito porque en Windows el default es PowerShell y
+        # no parsea bien los backslashes ni los condicionales inline.
+        shell: bash
+        env:
+          # Sin firma — clientes verán warning de SmartScreen / Gatekeeper
+          # pero la app se ejecuta. Cuando consigamos certs, agregar
+          # CSC_LINK / CSC_KEY_PASSWORD (mac) y WIN_CSC_LINK (win).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx electron-builder \
+            --${{ runner.os == 'Windows' && 'win' || 'mac' }} \
+            --${{ matrix.arch }} \
+            --publish never
+
+      - name: Ensure release exists in public repo
+        # Solo lo intenta el primer job (mac arm64) — los siguientes
+        # encuentran el release ya creado y solo suben sus assets.
+        if: matrix.arch == 'arm64' && runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          NOTES="${{ inputs.release_notes }}"
+          if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
+            echo "Release $TAG ya existe en $RELEASES_REPO — saltando creación."
+          else
+            echo "Creando release $TAG en $RELEASES_REPO…"
+            gh release create "$TAG" \
+              --repo "$RELEASES_REPO" \
+              --title "Pida Pues Printer ${TAG#printer-v}" \
+              --notes "$NOTES"
+          fi
+
+      - name: Rename binarios a nombres estables (sin versión)
+        # Los empleados descargan vía /releases/latest/download/<file> que
+        # apunta al último release. Para que la URL sea fija usamos nombres
+        # SIN número de versión: Pida-Pues-Printer-arm64.dmg, etc.
+        shell: bash
+        run: |
+          cd release
+          ls -la
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            for f in *.exe; do
+              [ -e "$f" ] && mv "$f" "Pida-Pues-Printer-${{ matrix.arch }}.exe" || true
+            done
+          else
+            for f in *.dmg; do
+              [ -e "$f" ] && mv "$f" "Pida-Pues-Printer-${{ matrix.arch }}.dmg" || true
+            done
+          fi
+          ls -la
+
+      - name: Wait for release to exist (jobs paralelos)
+        # Los jobs corren en paralelo; el job de mac-arm64 crea el release.
+        # Los demás esperan hasta que aparezca antes de subir su asset.
+        if: matrix.arch != 'arm64' || runner.os != 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          for i in {1..30}; do
+            if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
+              echo "Release $TAG listo."; exit 0
+            fi
+            echo "Esperando release… ($i/30)"; sleep 10
+          done
+          echo "::error::Release no apareció a tiempo"; exit 1
+
+      - name: Upload artifacts to public release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        shell: bash
+        run: |
+          cd release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            FILES=$(ls *.exe 2>/dev/null || true)
+          else
+            FILES=$(ls *.dmg 2>/dev/null || true)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "::error::No se encontraron instaladores para subir"; exit 1
+          fi
+          for f in $FILES; do
+            echo "Subiendo $f a ${RELEASES_REPO}@${{ inputs.tag }}…"
+            gh release upload "${{ inputs.tag }}" "$f" \
+              --repo "$RELEASES_REPO" --clobber
+          done
