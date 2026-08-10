@@ -179,6 +179,11 @@ function openConfigWindow() {
       nodeIntegration: false,
     },
   });
+  /* El <title> de la página pisa el título de la ventana en Electron. Por eso
+     la barra siguió diciendo la marca anterior aunque aquí arriba ya pusiera
+     "Inami Printer": mandaba el HTML del renderer, no esta opción. Ignorando
+     el evento, el nombre de la ventana lo decide solo este archivo. */
+  configWindow.on("page-title-updated", (e) => e.preventDefault());
   if (isDev) {
     configWindow.loadURL("http://localhost:5174/");
   } else {
