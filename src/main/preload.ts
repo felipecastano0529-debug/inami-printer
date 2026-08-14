@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("api", {
   getSettings: () => ipcRenderer.invoke("settings:get"),
   setSettings: (s: any) => ipcRenderer.invoke("settings:set", s),
   getSession: () => ipcRenderer.invoke("session:get"),
+  ensureSession: () => ipcRenderer.invoke("session:ensure"),
   setSession: (s: any) => ipcRenderer.invoke("session:set", s),
   getSupabaseConfig: () => ipcRenderer.invoke("config:supabase"),
   testPrint: () => ipcRenderer.invoke("printer:test"),

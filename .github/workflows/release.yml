@@ -1,17 +1,18 @@
-# Compila Inami Printer para macOS (arm64 + x64) y Windows (x64) y publica los
+# Compila Inami Printer para macOS (arm64 + Intel) y Windows (x64) y publica los
 # instaladores como release de ESTE repo, que es público: el equipo del local
 # descarga sin cuenta de GitHub.
 #
-# Antes publicaba en otro repo (`impresion-`) con un Personal Access Token,
-# porque el código vivía en un repo privado y los releases tenían que salir a
-# uno público. Este repo YA es público, así que sobra el rodeo y sobra el
-# token: basta el GITHUB_TOKEN que Actions inyecta solo.
-#
 # Cómo se usa:
 #   1. Sube la versión en package.json si toca.
-#   2. Actions → "Release Printer" → Run workflow, con el tag (ej. v0.5.3).
+#   2. Actions → "Release Printer" → Run workflow, con el tag (ej. v0.6.0).
 #   3. Compila los 3 instaladores y los sube al release. Al terminar ya se
 #      descargan desde /app → App impresora.
+#
+# Los nombres salen ya estables desde electron-builder vía
+# `artifactName: Inami-Printer-${arch}.${ext}` — NO renombrar aquí.
+# El bug viejo era justo ese: un `mv` renombraba TODOS los .dmg al nombre de la
+# arquitectura del job, así que el .dmg del build x64 sobreescribía al del
+# arm64. El instalador que decía "Apple Silicon" traía adentro un binario Intel.
 
 name: Release Printer
 
@@ -19,9 +20,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag del release (ej. v0.5.3)"
+        description: "Tag del release (ej. v0.6.0)"
         required: true
-        default: "v0.5.2"
+        default: "v0.6.0"
       release_notes:
         description: "Notas del release (opcional)"
         required: false
@@ -31,21 +32,44 @@ permissions:
   contents: write   # crear el release y subirle los binarios, en este mismo repo
 
 jobs:
+  # El release se crea UNA vez, antes de compilar, para que los jobs de build
+  # solo tengan que subir sus assets.
+  create-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG ya existe — saltando creación."
+          else
+            gh release create "$TAG" \
+              --title "Inami Printer ${TAG#v}" \
+              --notes "${{ inputs.release_notes }}"
+          fi
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14         # arm64 nativo
-            arch: arm64
-            target: dmg
-          - os: macos-13         # intel
-            arch: x64
-            target: dmg
+          # Un solo runner de mac compila las DOS arquitecturas: electron-builder
+          # cross-compila x64 desde Apple Silicon sin problema. Antes había un
+          # job aparte en `macos-13` (Intel) — esa imagen ya no existe en GitHub
+          # Actions, así que el job quedaba encolado sin runner hasta que lo
+          # mataba el límite de 24h. Resultado: el .dmg de Mac Intel nunca se
+          # subió y ese link de descarga daba 404.
+          - os: macos-latest
+            platform: mac
           - os: windows-latest
-            arch: x64
-            target: nsis
+            platform: win
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45   # que un runner atascado no queme 24h de cola
 
     steps:
       - uses: actions/checkout@v4
@@ -63,92 +87,93 @@ jobs:
         run: npm run build
 
       - name: Package (electron-builder)
-        # bash explícito porque en Windows el default es PowerShell y
-        # no parsea bien los backslashes ni los condicionales inline.
+        # Sin flags de arquitectura: salen del `build.mac.target` / `build.win.target`
+        # del package.json. Sin firma de Apple: la .app se firma ad-hoc en el hook
+        # afterPack, que es lo mínimo para que arranque en Apple Silicon — sin
+        # firma, macOS ni siquiera ofrece el diálogo, la mata directamente.
         shell: bash
-        env:
-          # Sin firma — clientes verán warning de SmartScreen / Gatekeeper
-          # pero la app se ejecuta. Cuando consigamos certs, agregar
-          # CSC_LINK / CSC_KEY_PASSWORD (mac) y WIN_CSC_LINK (win).
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          npx electron-builder \
-            --${{ runner.os == 'Windows' && 'win' || 'mac' }} \
-            --${{ matrix.arch }} \
-            --publish never
+        run: npx electron-builder --${{ matrix.platform }} --publish never
 
-      - name: Crear el release si no existe
-        # Solo lo intenta el primer job (mac arm64) — los siguientes
-        # encuentran el release ya creado y solo suben sus assets.
-        if: matrix.arch == 'arm64' && runner.os == 'macOS'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validar instaladores (mac)
+        # Monta cada .dmg y comprueba que adentro va la arquitectura que promete
+        # el nombre y que la .app está firmada. Sin esto ya publicamos un
+        # "arm64.dmg" con binario Intel adentro y nadie se enteró en 2 releases.
+        if: matrix.platform == 'mac'
         shell: bash
         run: |
-          TAG="${{ inputs.tag }}"
-          NOTES="${{ inputs.release_notes }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG ya existe — saltando creación."
-          else
-            echo "Creando release $TAG…"
-            gh release create "$TAG" \
-              \
-              --title "Inami Printer ${TAG#v}" \
-              --notes "$NOTES"
-          fi
-
-      - name: Rename binarios a nombres estables (sin versión)
-        # Los empleados descargan vía /releases/latest/download/<file> que
-        # apunta al último release. Para que la URL sea fija usamos nombres
-        # SIN número de versión: Inami-Printer-arm64.dmg, etc.
-        shell: bash
-        run: |
+          set -euo pipefail
           cd release
           ls -la
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            for f in *.exe; do
-              [ -e "$f" ] && mv "$f" "Inami-Printer-${{ matrix.arch }}.exe" || true
-            done
-          else
-            for f in *.dmg; do
-              [ -e "$f" ] && mv "$f" "Inami-Printer-${{ matrix.arch }}.dmg" || true
-            done
-          fi
-          ls -la
-
-      - name: Wait for release to exist (jobs paralelos)
-        # Los jobs corren en paralelo; el job de mac-arm64 crea el release.
-        # Los demás esperan hasta que aparezca antes de subir su asset.
-        if: matrix.arch != 'arm64' || runner.os != 'macOS'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          TAG="${{ inputs.tag }}"
-          for i in {1..30}; do
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              echo "Release $TAG listo."; exit 0
+          for arch in arm64 x64; do
+            dmg="Inami-Printer-${arch}.dmg"
+            if [ ! -f "$dmg" ]; then
+              echo "::error::No se generó $dmg"; exit 1
             fi
-            echo "Esperando release… ($i/30)"; sleep 10
+            mnt="$(mktemp -d)"
+            hdiutil attach "$dmg" -nobrowse -mountpoint "$mnt" -quiet
+            app="$mnt/Inami Printer.app"
+            bin="$app/Contents/MacOS/Inami Printer"
+            got="$(lipo -archs "$bin")"
+            want="$arch"; [ "$arch" = "x64" ] && want="x86_64"
+            echo "$dmg → arquitectura: $got (esperada: $want)"
+            if [ "$got" != "$want" ]; then
+              hdiutil detach "$mnt" -quiet || true
+              echo "::error::$dmg trae $got adentro, debería traer $want"; exit 1
+            fi
+            if ! codesign --verify --deep --strict "$app"; then
+              hdiutil detach "$mnt" -quiet || true
+              echo "::error::$dmg no está firmado — no abrirá en Apple Silicon"; exit 1
+            fi
+            echo "$dmg OK (firmado ad-hoc)"
+            hdiutil detach "$mnt" -quiet
           done
-          echo "::error::Release no apareció a tiempo"; exit 1
 
-      - name: Subir los instaladores al release
+      - name: Validar instalador (windows)
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          ls -la
+          [ -f "Inami-Printer-x64.exe" ] || { echo "::error::No se generó Inami-Printer-x64.exe"; exit 1; }
+
+      - name: Subir instaladores al release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          set -euo pipefail
           cd release
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            FILES=$(ls *.exe 2>/dev/null || true)
+          if [ "${{ matrix.platform }}" = "win" ]; then
+            FILES=$(ls Inami-Printer-*.exe 2>/dev/null || true)
           else
-            FILES=$(ls *.dmg 2>/dev/null || true)
+            FILES=$(ls Inami-Printer-*.dmg 2>/dev/null || true)
           fi
           if [ -z "$FILES" ]; then
             echo "::error::No se encontraron instaladores para subir"; exit 1
           fi
           for f in $FILES; do
             echo "Subiendo $f a ${{ inputs.tag }}…"
-            gh release upload "${{ inputs.tag }}" "$f" \
-              --clobber
+            gh release upload "${{ inputs.tag }}" "$f" --clobber
           done
+
+  # Comprueba que los tres links que usa la página de descarga devuelven 200 de
+  # verdad. Es la prueba que faltaba: el de Mac Intel llevaba dos releases en 404
+  # y no había nada que lo detectara.
+  verify-downloads:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Los 3 links de descarga responden 200
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${{ github.repository }}/releases/latest/download"
+          FAIL=0
+          for f in Inami-Printer-arm64.dmg Inami-Printer-x64.dmg Inami-Printer-x64.exe; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -IL "$BASE/$f")
+            echo "$code  $BASE/$f"
+            [ "$code" = "200" ] || FAIL=1
+          done
+          [ "$FAIL" = "0" ] || { echo "::error::Algún instalador no quedó publicado"; exit 1; }

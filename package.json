@@ -1,6 +1,6 @@
 {
   "name": "inami-printer",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/felipecastano0529-debug/build-stellar-platform.git"
@@ -24,6 +24,7 @@
     "productName": "Inami Printer",
     "artifactName": "Inami-Printer-${arch}.${ext}",
     "publish": null,
+    "afterPack": "scripts/adhoc-sign.js",
     "files": [
       "dist/**/*",
       "node_modules/**/*",
@@ -43,7 +44,9 @@
           ]
         }
       ],
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "identity": null,
+      "hardenedRuntime": false
     },
     "win": {
       "target": [

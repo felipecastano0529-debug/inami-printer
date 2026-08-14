@@ -12,6 +12,7 @@ declare global {
       setSettings: (s: any) => Promise<any>;
       getSession: () => Promise<any>;
       setSession: (s: any) => Promise<any>;
+      ensureSession: () => Promise<{ ok: boolean; expired: boolean; session: any }>;
       getSupabaseConfig: () => Promise<{ url: string; anonKey: string }>;
       testPrint: () => Promise<boolean>;
       testNotification: () => Promise<boolean>;
@@ -29,39 +30,80 @@ export default function App() {
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Error de la carga de restaurantes, separado del de login: antes se tragaba
+  // en silencio y la app caía en una pantalla con "Restaurante —" sin salida.
+  const [tenantsError, setTenantsError] = useState<string | null>(null);
+  const [loadingTenants, setLoadingTenants] = useState(false);
 
   useEffect(() => {
     (async () => {
       const cfg = await window.api.getSupabaseConfig();
-      const ses = await window.api.getSession();
+      // El main renueva el token si hace falta y nos devuelve el vigente.
+      const state = await window.api.ensureSession();
       const set = await window.api.getSettings();
       const prs = await window.api.listPrinters();
       setConfig(cfg);
-      setSession(ses);
+      setSession(state.session);
       setSettings(set);
       setPrinters(prs);
 
-      if (ses?.accessToken && cfg) {
-        await loadTenants(cfg, ses.accessToken, ses.refreshToken);
+      if (state.expired) {
+        setError("Tu sesión expiró. Vuelve a iniciar sesión para seguir imprimiendo.");
+      } else if (state.ok && state.session?.accessToken && cfg) {
+        await loadTenants(cfg, state.session.accessToken);
       }
       setLoading(false);
     })();
   }, []);
 
-  async function loadTenants(cfg: { url: string; anonKey: string }, accessToken: string, refreshToken: string) {
-    const sb = createClient(cfg.url, cfg.anonKey, { auth: { persistSession: false, autoRefreshToken: false } });
-    await sb.auth.setSession({ access_token: accessToken, refresh_token: refreshToken || "" });
-    const { data: roles } = await sb.from("user_roles").select("tenant_id, role, tenant:tenants(id, name)").not("tenant_id", "is", null);
-    const list: Tenant[] = [];
-    const seen = new Set();
-    for (const r of (roles as any[]) ?? []) {
-      const t = (r as any).tenant;
-      if (t && !seen.has(t.id)) {
-        list.push({ id: t.id, name: t.name });
-        seen.add(t.id);
+  // Usa el access_token como Bearer, sin tocar el refresh_token: el refresco es
+  // responsabilidad exclusiva del proceso principal.
+  async function loadTenants(cfg: { url: string; anonKey: string }, accessToken: string) {
+    setLoadingTenants(true);
+    setTenantsError(null);
+    try {
+      const sb = createClient(cfg.url, cfg.anonKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: `Bearer ${accessToken}` } },
+      });
+      const { data: roles, error } = await sb
+        .from("user_roles")
+        .select("tenant_id, role, tenant:tenants(id, name)")
+        .not("tenant_id", "is", null);
+
+      if (error) {
+        setTenantsError(error.message);
+        return;
       }
+
+      const list: Tenant[] = [];
+      const seen = new Set();
+      for (const r of (roles as any[]) ?? []) {
+        const t = (r as any).tenant;
+        if (t && !seen.has(t.id)) {
+          list.push({ id: t.id, name: t.name });
+          seen.add(t.id);
+        }
+      }
+      setTenants(list);
+      if (list.length === 0) {
+        setTenantsError("Tu cuenta no tiene ningún restaurante asignado.");
+      }
+    } catch (e: any) {
+      setTenantsError(e?.message ?? "No se pudieron cargar los restaurantes");
+    } finally {
+      setLoadingTenants(false);
     }
-    setTenants(list);
+  }
+
+  async function retryTenants() {
+    const state = await window.api.ensureSession();
+    setSession(state.session);
+    if (!state.ok || !state.session?.accessToken) {
+      setError("Tu sesión expiró. Vuelve a iniciar sesión.");
+      return;
+    }
+    if (config) await loadTenants(config, state.session.accessToken);
   }
 
   async function handleLogin(email: string, password: string) {
@@ -76,9 +118,11 @@ export default function App() {
         refreshToken: data.session?.refresh_token,
         userEmail: data.user?.email,
       };
+      // El main fusiona con lo guardado, así que el restaurante ya elegido
+      // sobrevive a un re-login.
       const ses = await window.api.setSession(newSession);
       setSession(ses);
-      await loadTenants(config, newSession.accessToken!, newSession.refreshToken!);
+      await loadTenants(config, newSession.accessToken!);
     } catch (e: any) {
       setError(e?.message ?? "Error de login");
     }
@@ -88,6 +132,17 @@ export default function App() {
     const newSession = { ...session, tenantId: t.id, tenantName: t.name };
     const ses = await window.api.setSession(newSession);
     setSession(ses);
+  }
+
+  // Volver al selector sin cerrar sesión — elegir mal el restaurante era
+  // irreversible desde la UI.
+  async function handleChangeTenant() {
+    const ses = await window.api.setSession({ ...session, tenantId: undefined, tenantName: undefined });
+    setSession(ses);
+    const state = await window.api.ensureSession();
+    if (state.ok && state.session?.accessToken && config) {
+      await loadTenants(config, state.session.accessToken);
+    }
   }
 
   async function handleLogout() {
@@ -108,20 +163,42 @@ export default function App() {
     return <Login onLogin={handleLogin} error={error} />;
   }
 
-  // ─── Selector de tenant si tiene varios y no eligió todavía ───
-  if (!session.tenantId && tenants.length > 0) {
+  // ─── Sin restaurante elegido ───
+  // Nunca se cae a la pantalla de impresora sin tenant: antes, si la consulta
+  // de restaurantes fallaba o volvía vacía, esta rama no entraba y la app
+  // mostraba "Restaurante —" sin manera de arreglarlo.
+  if (!session.tenantId) {
     return (
       <div style={{ padding: 8 }}>
         <Header userEmail={session.userEmail} onLogout={handleLogout} />
         <h2 style={{ marginTop: 24, marginBottom: 12 }}>Elige el restaurante</h2>
-        <p style={panelMuted}>Vamos a imprimir los pedidos de este restaurante en esta impresora.</p>
-        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-          {tenants.map((t) => (
-            <button key={t.id} onClick={() => handlePickTenant(t)} style={btnPrimary}>
-              {t.name}
-            </button>
-          ))}
-        </div>
+
+        {loadingTenants && <p style={panelMuted}>Cargando restaurantes…</p>}
+
+        {!loadingTenants && tenants.length > 0 && (
+          <>
+            <p style={panelMuted}>Vamos a imprimir los pedidos de este restaurante en esta impresora.</p>
+            <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+              {tenants.map((t) => (
+                <button key={t.id} onClick={() => handlePickTenant(t)} style={btnPrimary}>
+                  {t.name}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        {!loadingTenants && tenants.length === 0 && (
+          <>
+            <p style={{ ...panelMuted, color: "var(--warning)" }}>
+              {tenantsError ?? "No pudimos cargar tus restaurantes."}
+            </p>
+            <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+              <button onClick={retryTenants} style={btnPrimary}>Reintentar</button>
+              <button onClick={handleLogout} style={btnGlass}>Entrar con otra cuenta</button>
+            </div>
+          </>
+        )}
       </div>
     );
   }
@@ -134,7 +211,12 @@ export default function App() {
       <Card>
         <Row>
           <Label>Restaurante</Label>
-          <strong>{session.tenantName ?? "—"}</strong>
+          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <strong>{session.tenantName ?? "—"}</strong>
+            <button onClick={handleChangeTenant} style={{ ...btnGlass, padding: "4px 8px", fontSize: 12 }}>
+              Cambiar
+            </button>
+          </span>
         </Row>
         <Row>
           <Label>Estado</Label>

@@ -3,7 +3,7 @@
 // y, cuando llega un pedido nuevo (INSERT), abre una ventana invisible con
 // el HTML del ticket y la imprime silently al printer seleccionado.
 
-import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, Notification } from "electron";
+import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, Notification, powerMonitor } from "electron";
 import path from "node:path";
 import Store from "electron-store";
 
@@ -63,13 +63,15 @@ function alreadyPrinted(orderId: string): boolean {
 
 let tray: Tray | null = null;
 let configWindow: BrowserWindow | null = null;
-let printWindow: BrowserWindow | null = null;
 let supabaseChannel: any = null;
 let supabaseClient: any = null;          // cliente compartido (autoRefresh activo)
 let refreshTimer: NodeJS.Timeout | null = null;
 let pollingTimer: NodeJS.Timeout | null = null;
 let realtimeStatus: "DISCONNECTED" | "SUBSCRIBING" | "SUBSCRIBED" | "ERROR" = "DISCONNECTED";
 let lastSeenAt: Date | null = null;
+// Se prende cuando el refresh_token guardado ya no sirve. Sin esto el plugin
+// se quedaba "conectado" en el tray mientras no imprimía nada.
+let sessionExpired = false;
 
 // Config de runtime (proyecto Supabase de Inami).
 //
@@ -98,8 +100,10 @@ function buildTrayMenu() {
 
   return Menu.buildFromTemplate([
     {
-      label: isLoggedIn
-        ? `📡 ${session?.tenantName || "Conectado"} · ${session?.userEmail || ""}`
+      label: sessionExpired
+        ? "⚠️ Sesión expirada — vuelve a iniciar sesión"
+        : isLoggedIn
+        ? `📡 ${session?.tenantName || "Sin local elegido"} · ${session?.userEmail || ""}`
         : "❌ Sin sesión",
       enabled: false,
     },
@@ -204,7 +208,7 @@ async function getSupabase() {
   if (!session?.accessToken) return null;
 
   const { createClient } = await import("@supabase/supabase-js");
-  supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     realtime: { params: { eventsPerSecond: 10 } },
     auth: {
       persistSession: false,
@@ -212,16 +216,73 @@ async function getSupabase() {
     },
   });
 
-  await supabaseClient.auth.setSession({
+  // `setSession` renueva solo si el access_token ya venció, y devuelve tokens
+  // NUEVOS — Supabase rota el refresh_token en cada uso e invalida el anterior.
+  //
+  // Aquí estaba el bug que dejaba la caja sin imprimir: se ignoraba lo que
+  // devolvía esta llamada, así que el refresh_token rotado nunca llegaba a
+  // disco. El de disco quedaba revocado y al siguiente arranque ya no había
+  // forma de autenticar: las consultas volvían vacías por RLS, el selector de
+  // local se quedaba en "—" y no se imprimía nada. Sin un solo error a la
+  // vista, porque nadie miraba el resultado.
+  const { data, error } = await client.auth.setSession({
     access_token: session.accessToken,
     refresh_token: session.refreshToken || "",
   });
 
-  // Realtime también necesita el JWT explícitamente para canales con RLS
-  try { await supabaseClient.realtime.setAuth(session.accessToken); } catch {}
+  if (error || !data?.session) {
+    handleSessionExpired(error?.message ?? "setSession no devolvió sesión");
+    return null;
+  }
+
+  persistRefreshedTokens(session, data.session);
+  supabaseClient = client;
+
+  // Realtime necesita el JWT explícitamente para canales con RLS — y tiene que
+  // ser el token FRESCO, no el que veníamos arrastrando de disco.
+  try { await supabaseClient.realtime.setAuth(data.session.access_token); } catch {}
 
   startRefreshLoop();
   return supabaseClient;
+}
+
+// Guarda en disco los tokens que devolvió Supabase, si cambiaron.
+function persistRefreshedTokens(prev: any, fresh: { access_token: string; refresh_token: string }) {
+  if (fresh.access_token === prev.accessToken && fresh.refresh_token === prev.refreshToken) return;
+  store.set("session", { ...prev, accessToken: fresh.access_token, refreshToken: fresh.refresh_token });
+  console.log("Sesión renovada y guardada.");
+}
+
+// El refresh_token ya no sirve (revocado, rotado fuera de sincronía, o alguien
+// cerró sesión desde otro lado). Se borran los tokens pero se conserva el local
+// elegido, para que volver a entrar sea solo escribir la clave.
+//
+// Lo importante es que esto se NOTE: un local que dejó de imprimir sin aviso
+// pierde comandas hasta que alguien se da cuenta a mano.
+function handleSessionExpired(reason?: string) {
+  if (sessionExpired) return; // no repetir la alerta en cada reintento
+  console.error("Sesión inválida o expirada:", reason);
+  sessionExpired = true;
+
+  const prev = store.get("session");
+  store.set(
+    "session",
+    prev ? { tenantId: prev.tenantId, tenantName: prev.tenantName, userEmail: prev.userEmail } : null,
+  );
+
+  void stopRealtime();
+  realtimeStatus = "DISCONNECTED";
+  refreshTrayMenu();
+
+  try {
+    new Notification({
+      title: "Inami Printer — sesión expirada",
+      body: "Dejó de imprimir. Abre el plugin y vuelve a iniciar sesión.",
+      urgency: "critical",
+    }).show();
+  } catch { /* algunas distros no tienen notificaciones */ }
+
+  openConfigWindow();
 }
 
 // Refresca el access_token cada 50 minutos (los tokens viven 1h por default).
@@ -236,7 +297,12 @@ function startRefreshLoop() {
         refresh_token: session.refreshToken,
       });
       if (error || !data.session) {
+        // Antes esto solo se logueaba y el plugin seguía "verde" en el tray
+        // sin poder consultar nada. Si el token está revocado no hay reintento
+        // que valga: hay que avisar y pedir login.
+        const dead = /invalid|revoked|not found|expired/i.test(error?.message ?? "");
         console.error("Token refresh failed:", error?.message);
+        if (dead) handleSessionExpired(error?.message);
         return;
       }
       store.set("session", {
@@ -493,6 +559,9 @@ async function stopRealtime() {
     supabaseChannel = null;
   }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  // El polling de respaldo también se apaga: si no, seguía despertando cada
+  // 25s tras cerrar sesión, sin cliente con el cual consultar.
+  if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; }
   supabaseClient = null;
 }
 
@@ -629,56 +698,84 @@ async function printTestTicket(): Promise<boolean> {
 // IMPORTANTE: nada de `offscreen: true` — webContents.print() requiere el
 // pipeline de rendering normal de Chromium para producir PDF al spooler.
 // Devuelve true si TODAS las copias se enviaron sin error al spooler.
+// Cola de impresión.
+//
+// `printWindow` era una única variable global y cada llamada arrancaba
+// cerrando la ventana de la anterior. Con dos comandas entrando casi a la vez
+// —lo normal en hora pico— la segunda mataba la ventana de la primera a media
+// impresión: el callback de `print()` no volvía nunca, la promesa quedaba
+// colgada para siempre y esa comanda simplemente no salía. Ahora cada
+// impresión tiene su propia ventana y se ejecutan de a una, en orden.
+let printQueue: Promise<unknown> = Promise.resolve();
+
+function enqueuePrint<T>(task: () => Promise<T>): Promise<T> {
+  const run = printQueue.then(task, task); // el fallo de una no cancela la siguiente
+  printQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 async function renderAndPrint(html: string, printerName: string, copies: number, silent: boolean): Promise<boolean> {
-  if (printWindow) {
-    try { printWindow.close(); } catch {}
-    printWindow = null;
-  }
-  printWindow = new BrowserWindow({
+  return enqueuePrint(() => renderAndPrintNow(html, printerName, copies, silent));
+}
+
+async function renderAndPrintNow(html: string, printerName: string, copies: number, silent: boolean): Promise<boolean> {
+  const win = new BrowserWindow({
     show: false,
     width: 800,
     height: 1200,
     webPreferences: { offscreen: false, contextIsolation: true, nodeIntegration: false },
   });
-  await printWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-  // Espera a que TODAS las imágenes (logo) hayan terminado de cargar antes
-  // de imprimir, sino el ticket sale sin logo en silent mode.
-  try {
-    await printWindow.webContents.executeJavaScript(`
-      Promise.all(Array.from(document.images).map(img =>
-        img.complete ? Promise.resolve() :
-          new Promise(r => { img.onload = img.onerror = () => r(null); })
-      )).then(() => true)
-    `);
-  } catch {}
-  // Margen extra para layout de @page después de que el browser midió las imgs
-  await new Promise((r) => setTimeout(r, 200));
 
-  let allOk = true;
-  for (let i = 0; i < copies; i++) {
-    const ok = await new Promise<boolean>((resolve) => {
-      printWindow!.webContents.print(
-        {
-          silent,
-          deviceName: printerName,
-          printBackground: true,
-          margins: { marginType: "none" },
-        },
-        (success, errorType) => {
-          if (!success) console.error(`Print error: ${errorType}`);
-          resolve(success);
-        },
-      );
-    });
-    if (!ok) allOk = false;
-  }
-  setTimeout(() => {
-    if (printWindow) {
-      try { printWindow.close(); } catch {}
-      printWindow = null;
+  try {
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    // Espera a que TODAS las imágenes (logo) hayan terminado de cargar antes
+    // de imprimir, sino el ticket sale sin logo en silent mode.
+    try {
+      await win.webContents.executeJavaScript(`
+        Promise.all(Array.from(document.images).map(img =>
+          img.complete ? Promise.resolve() :
+            new Promise(r => { img.onload = img.onerror = () => r(null); })
+        )).then(() => true)
+      `);
+    } catch {}
+    // Margen extra para layout de @page después de que el browser midió las imgs
+    await new Promise((r) => setTimeout(r, 200));
+
+    let allOk = true;
+    for (let i = 0; i < copies; i++) {
+      const ok = await new Promise<boolean>((resolve) => {
+        // Guarda de tiempo: si el driver de la térmica se cuelga, el callback
+        // de `print()` puede no volver nunca. Sin esto la cola entera se
+        // quedaría trancada y el local dejaría de imprimir en silencio.
+        const timer = setTimeout(() => {
+          console.error("Print timeout: la impresora no respondió en 30s");
+          resolve(false);
+        }, 30_000);
+
+        win.webContents.print(
+          {
+            silent,
+            deviceName: printerName,
+            printBackground: true,
+            margins: { marginType: "none" },
+          },
+          (success, errorType) => {
+            clearTimeout(timer);
+            if (!success) console.error(`Print error: ${errorType}`);
+            resolve(success);
+          },
+        );
+      });
+      if (!ok) allOk = false;
     }
-  }, 1500);
-  return allOk;
+    return allOk;
+  } finally {
+    // Siempre se destruye, también si algo lanzó antes de imprimir: si no,
+    // cada fallo dejaba una ventana oculta viva hasta cerrar la app.
+    setTimeout(() => {
+      try { if (!win.isDestroyed()) win.destroy(); } catch {}
+    }, 1500);
+  }
 }
 
 // HTML del ticket — formato POS v0.5.0
@@ -980,18 +1077,45 @@ ipcMain.handle("settings:set", (_e, settings: Settings) => {
 });
 
 ipcMain.handle("session:get", () => store.get("session"));
-ipcMain.handle("session:set", async (_e, session: SessionState | null) => {
-  store.set("session", session);
+ipcMain.handle("session:set", async (_e, incoming: SessionState | null) => {
+  if (!incoming) {
+    store.set("session", null);
+    sessionExpired = false;
+    refreshTrayMenu();
+    await stopRealtime();
+    return null;
+  }
+
+  // Se fusiona con lo que ya había en vez de reemplazarlo: al volver a entrar
+  // tras una expiración, el renderer manda solo los tokens y el email, y sin
+  // este merge se perdía el local ya elegido — obligando a elegirlo otra vez
+  // en cada login.
+  const prev = store.get("session") ?? {};
+  const merged: SessionState = { ...prev, ...incoming };
+  store.set("session", merged);
+  sessionExpired = false;
   refreshTrayMenu();
-  if (session?.accessToken && session.tenantId) {
+
+  if (merged.accessToken && merged.tenantId) {
     await startRealtime();
   } else {
     await stopRealtime();
   }
-  return session;
+  return store.get("session");
 });
 
 ipcMain.handle("config:supabase", () => ({ url: SUPABASE_URL, anonKey: SUPABASE_ANON_KEY }));
+
+// Deja la sesión lista y devuelve el access_token vigente.
+//
+// El renderer NO renueva tokens por su cuenta: si los dos lados llamaran a
+// refresh con el mismo refresh_token, la rotación de Supabase invalidaría el
+// del otro y la sesión se caería sola. El main es el único dueño del refresco;
+// el renderer pide el token ya fresco y lo usa como Bearer.
+ipcMain.handle("session:ensure", async () => {
+  const sb = await getSupabase();
+  return { ok: !!sb, expired: sessionExpired, session: store.get("session") };
+});
 
 ipcMain.handle("printer:test", async () => {
   return await printTestTicket();
@@ -1016,6 +1140,19 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
 app.whenReady().then(async () => {
   createTray();
+
+  // El Mac de una caja duerme todas las noches. Al despertar, el socket de
+  // realtime está muerto y el access_token venció hace horas: los timers
+  // siguen agendados pero el plugin no imprime hasta que alguien lo reinicia.
+  // Al volver de suspensión se rehace la conexión desde cero.
+  powerMonitor.on("resume", async () => {
+    const s = store.get("session");
+    if (!s?.accessToken || !s.tenantId) return;
+    console.log("Equipo despertó — reconectando…");
+    await stopRealtime();          // tira cliente y socket viejos
+    await startRealtime();         // getSupabase() renueva el token de entrada
+  });
+
   // Si ya hay sesión, arrancamos Realtime sin abrir ventana
   const session = store.get("session");
   if (session?.accessToken && session.tenantId) {
