@@ -6,6 +6,8 @@
 import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, Notification, powerMonitor } from "electron";
 import path from "node:path";
 import Store from "electron-store";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const WebSocketImpl = require("ws");
 
 const isDev = process.env.NODE_ENV === "development";
 
@@ -209,7 +211,16 @@ async function getSupabase() {
 
   const { createClient } = await import("@supabase/supabase-js");
   const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    realtime: { params: { eventsPerSecond: 10 } },
+    realtime: {
+      params: { eventsPerSecond: 10 },
+      // realtime-js dejó de traer fallback a `ws`: usa el WebSocket nativo, y
+      // Electron 32 corre Node 20, que no lo tiene. Sin transport explícito el
+      // socket NUNCA abre y el canal muere en TIMED_OUT — en silencio, sin
+      // error. El plugin quedaba viviendo solo del polling de 25s: imprimía,
+      // pero con retraso y sin nada "en vivo". Verificado A/B dentro de
+      // Electron: sin transport → TIMED_OUT, con transport → SUBSCRIBED.
+      transport: WebSocketImpl,
+    },
     auth: {
       persistSession: false,
       autoRefreshToken: false, // lo manejamos a mano para persistir en electron-store
@@ -1162,14 +1173,23 @@ app.whenReady().then(async () => {
   }
 });
 
-// No hacer app.quit() al cerrar ventanas — el plugin vive en el tray.
-// En macOS este es el comportamiento por defecto; en Win/Linux NO subscribirse
-// a window-all-closed evita el quit automático.
-if (process.platform !== "darwin") {
-  app.on("window-all-closed", () => {
-    // intencional: no llamamos app.quit()
-  });
-}
+// El plugin vive en el tray: cerrar ventanas NUNCA debe cerrar la app.
+//
+// Esto estaba al revés y era el bug más grave de todos. El default de Electron
+// —documentado, y en TODAS las plataformas, macOS incluido— es cerrar la app
+// cuando se cierra la última ventana si nadie escucha este evento. El idiom
+// habitual es suscribirse y llamar app.quit() solo fuera de macOS; aquí se
+// hacía lo contrario: se suscribía solo fuera de macOS, dejando a macOS con el
+// default. Resultado: en Mac la app se moría sola.
+//
+// Y no hacía falta cerrar la ventana de configuración a mano: la app abre y
+// cierra ventanas ocultas todo el tiempo —el beep (1.2s) y la de impresión
+// (1.5s)—. Cada una que se cerraba sin otra abierta mataba el plugin. Es decir:
+// sonaba la campana de la primera comanda y el plugin desaparecía, justo cuando
+// tenía que empezar a trabajar.
+app.on("window-all-closed", () => {
+  // intencional: no llamamos app.quit() en ninguna plataforma
+});
 
 app.on("before-quit", async () => {
   await stopRealtime();
