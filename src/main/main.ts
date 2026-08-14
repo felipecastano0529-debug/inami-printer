@@ -31,6 +31,10 @@ interface SessionState {
 interface OfflineState {
   lastSeenAt: string | null; // ISO timestamp del último pedido visto/impreso
   printedIds: string[];      // IDs de pedidos ya impresos (cap 1000)
+  // IDs de los que ya se avisó (campana + notificación). Va aparte de
+  // printedIds a propósito: si la impresión falla queremos REINTENTAR la
+  // impresión, pero NO volver a sonar la campana.
+  notifiedIds?: string[];    // cap 1000
 }
 
 // Set en memoria de IDs en proceso de impresión — evita race condition
@@ -48,7 +52,7 @@ const store = new Store<{
       soundEnabled: true, notificationEnabled: true,
     },
     session: null,
-    offline: { lastSeenAt: null, printedIds: [] },
+    offline: { lastSeenAt: null, printedIds: [], notifiedIds: [] },
   },
 });
 
@@ -61,6 +65,18 @@ function markPrinted(orderId: string) {
 }
 function alreadyPrinted(orderId: string): boolean {
   return store.get("offline").printedIds.includes(orderId);
+}
+
+// Aviso al humano (campana + notificación del sistema): una sola vez por
+// pedido, pase lo que pase con la impresión.
+function markNotified(orderId: string) {
+  const off = store.get("offline");
+  const prev = off.notifiedIds ?? [];
+  if (prev.includes(orderId)) return;
+  store.set("offline", { ...off, notifiedIds: [...prev, orderId].slice(-1000) });
+}
+function alreadyNotified(orderId: string): boolean {
+  return (store.get("offline").notifiedIds ?? []).includes(orderId);
 }
 
 let tray: Tray | null = null;
@@ -505,12 +521,20 @@ async function onNewOrder(sb: any, orderHeader: { id: string }) {
     .eq("id", orderHeader.id)
     .maybeSingle();
 
-  if (settings.notificationEnabled !== false && meta) {
-    showNewOrderNotification(meta);
+  // El aviso va UNA vez por pedido. Antes sonaba antes de imprimir y sin
+  // registrar nada: si la impresión fallaba —impresora sin elegir, apagada,
+  // sin papel— el pedido nunca se marcaba, el catch-up lo volvía a encontrar
+  // a los 25s y la campana sonaba otra vez. Y otra. Indefinidamente.
+  if (!alreadyNotified(orderHeader.id)) {
+    if (settings.notificationEnabled !== false && meta) {
+      showNewOrderNotification(meta);
+    }
+    if (settings.soundEnabled !== false) {
+      playBeep();
+    }
+    markNotified(orderHeader.id);
   }
-  if (settings.soundEnabled !== false) {
-    playBeep();
-  }
+
   const ok = await printOrder(orderHeader.id);
   // Solo marcar como impreso si el spooler aceptó el job. Si falló, dejamos
   // el id sin marcar para que el próximo catch-up lo reintente.
