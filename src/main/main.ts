@@ -1012,7 +1012,7 @@ function renderCopyPOS(args: {
       <table class="ip-payment">
         <tbody>
           <tr><td>Método de pago:</td><td class="ip-right">${escapeHtml(paymentLabel(order.payment_method))}</td></tr>
-          <tr><td>Estado:</td><td class="ip-right">${escapeHtml(order.payment_status || "pending")}</td></tr>
+          <tr><td>Estado del pago:</td><td class="ip-right">${escapeHtml(paymentStatusLabel(order.payment_status || "pending"))}</td></tr>
         </tbody>
       </table>
 
@@ -1040,6 +1040,19 @@ async function generateQRDataUrl(text: string): Promise<string | null> {
   } catch (e) {
     console.error("QR generation failed:", e);
     return null;
+  }
+}
+
+// El ticket lo lee el cliente, y sale todo en español menos esta línea: hasta
+// ahora imprimía el enum crudo de la base ("pending"). Los valores vienen del
+// enum payment_status de Postgres: pending | approved | declined | refunded.
+function paymentStatusLabel(s: string): string {
+  switch (s) {
+    case "pending": return "Pendiente";
+    case "approved": return "Pagado";
+    case "declined": return "Rechazado";
+    case "refunded": return "Reembolsado";
+    default: return s;
   }
 }
 
