@@ -1146,10 +1146,32 @@ ipcMain.handle("notification:test", async () => {
 // ──────────────────────────────────────────────────────
 // App lifecycle
 // ──────────────────────────────────────────────────────
+// Una sola instancia: dos plugins vivos imprimirían la misma comanda dos
+// veces. Además, el segundo intento de abrir la app trae al frente la ventana
+// del primero en vez de no hacer nada.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) app.quit();
+
+app.on("second-instance", () => {
+  openConfigWindow();
+});
+
+// Click en el ícono del Dock o doble click en la app estando ya abierta.
+//
+// Sin esto la app era inalcanzable: cuando hay sesión válida arranca directo
+// al tray SIN ventana, así que al hacer doble click macOS solo activaba la
+// instancia existente y no pasaba nada. Parecía que la app no abría, y la
+// única entrada era el menú de la barra del sistema — que nadie encuentra.
+app.on("activate", () => {
+  openConfigWindow();
+});
+
 // Habilita reproducir el beep sin gesto de usuario (HTML5 audio).
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
 app.whenReady().then(async () => {
+  if (!gotTheLock) return;
+
   createTray();
 
   // El Mac de una caja duerme todas las noches. Al despertar, el socket de
