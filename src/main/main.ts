@@ -985,8 +985,20 @@ function renderTicketHtml(args: {
   }
   .invoice-print .ip-logo-wrap { text-align: center; margin-bottom: 4px; }
   .invoice-print .ip-logo {
-    max-height: ${compact ? 50 : 70}px; max-width: 90%; object-fit: contain;
-    filter: grayscale(1) brightness(1.08) contrast(2.2);
+    /* Más grande: antes 70/50px. El ancho imprimible YA es el real (72mm,
+       ver anchoImprimibleMm arriba) así que hay margen de verdad — antes esto
+       se pedía chico por miedo a desbordar un ancho que ya estaba mal
+       calculado. Un logo con rayos finos y texto pequeño anidado necesita
+       más puntos físicos de la térmica para sobrevivir, no menos. */
+    max-height: ${compact ? 70 : 100}px; max-width: 92%; object-fit: contain;
+    /* contrast(2.2) era una curva suave: un logo con dos colores que caen
+       cerca en escala de grises (acá, el verde azulado y el magenta) se
+       queda con zonas a medio camino entre negro y blanco, y ESO es lo que
+       el driver dithera como ruido —lo que se ve como "borroso"—, no falta
+       de resolución. contrast(9) empuja casi todo a blanco o negro puro,
+       más cerca de un umbral binario real; una térmica no tiene punto medio,
+       así que hay que dárselo ya decidido. */
+    filter: grayscale(1) brightness(1.03) contrast(9);
   }
   .invoice-print .ip-header { text-align: center; line-height: 1.3; }
   .invoice-print .ip-header-primary { font-weight: 700; font-size: ${baseFont + 2}px; }
