@@ -823,8 +823,14 @@ async function renderAndPrintNow(html: string, printerName: string, paperWidthMm
        (`document.body.scrollHeight`, en píxeles CSS a 96dpi, que es lo que
        Chromium usa internamente) y ese alto exacto —con un colchón chico—
        es lo que se le pide al driver como tamaño de página, en micrones
-       (Electron pide micrones: 1mm = 1000). El ancho es fijo por lo que la
-       sede configuró (58 u 80mm); el alto es SIEMPRE el del ticket real. */
+       (Electron pide micrones: 1mm = 1000). El alto es SIEMPRE el del
+       ticket real, medido. El ancho —ver `anchoImprimibleMm()`— NO es el
+       nominal de la sede (80mm): es lo que la térmica de verdad imprime de
+       ese rollo (72mm), el MISMO número que ya usó `renderTicketHtml` para
+       la caja del HTML. Pedirle al driver un ancho mayor que el real fue
+       exactamente lo que cortó la columna de precios en la comanda de
+       prueba: lo que sobra de página no cabe en el rollo y se pierde por
+       el borde derecho, que es donde vive todo lo alineado a la derecha. */
     let heightMicrons = 297_000; // ~A4 de alto, respaldo si la medición falla
     try {
       const heightPx = await win.webContents.executeJavaScript(
@@ -837,7 +843,7 @@ async function renderAndPrintNow(html: string, printerName: string, paperWidthMm
     } catch (e) {
       console.error("No se pudo medir el alto del ticket, usando respaldo:", e);
     }
-    const widthMicrons = Math.max(40, paperWidthMm) * 1000;
+    const widthMicrons = anchoImprimibleMm(paperWidthMm === 58 ? 58 : 80) * 1000;
 
     return await new Promise<boolean>((resolve) => {
       // Guarda de tiempo: si el driver de la térmica se cuelga, el callback
@@ -872,7 +878,33 @@ async function renderAndPrintNow(html: string, printerName: string, paperWidthMm
   }
 }
 
-// HTML del ticket — formato POS v0.6.0
+/* ¿Cuántos mm de un rollo "de 80mm" imprime la térmica DE VERDAD?
+   Nunca los 80mm completos. El fabricante deja un margen mecánico a cada
+   lado para el sensor de papel y el cuchillo del cutter, y lo que de verdad
+   queda disponible para tinta —lo que cualquier hoja de specs de una
+   térmica de 80mm llama "print width"— son 72mm. Para un rollo "de 58mm"
+   son 48mm. No es una cifra inventada para esta app: es la que repiten las
+   fichas técnicas de cualquier térmica ESC/POS de este tamaño.
+
+   Antes se restaban 4mm a mano (76mm de 80) por prudencia, y quedó corto:
+   la comanda de la foto salía con la columna de precios, el teléfono y la
+   fecha cortados por el borde derecho — todo lo que vive pegado al margen
+   derecho, que es justo donde ese exceso de 4mm se nota primero.
+
+   Y esto no es solo "una caja más angosta": es el mismo número, dos veces.
+   Antes la caja CSS medía 76mm pero el driver recibía un pageSize de 80mm
+   —dos ideas distintas de dónde termina la página—, y encima el CSS
+   declaraba SU PROPIO `@page { size: 80mm auto }` al lado del `pageSize`
+   que ya se le mandaba a `print()` por JS. Dos fuentes de verdad para el
+   mismo dato es como se cuela media hoja de más en un lado sin que el CSS
+   por sí solo lo explique. Ahora el `@page` del CSS ya no declara tamaño —
+   la única fuente es esta función, y tanto la caja (`renderTicketHtml`)
+   como el pageSize real (`renderAndPrintNow`) la llaman a ella. */
+function anchoImprimibleMm(nominalMm: number): number {
+  return nominalMm === 58 ? 48 : 72;
+}
+
+// HTML del ticket — formato POS v0.7.0
 //
 // Port directo del formato del proyecto principal (src/lib/printTicket.ts →
 // renderCopy), incluyendo el arreglo de calidad de impresión de agosto 2026:
@@ -908,10 +940,10 @@ function renderTicketHtml(args: {
   copyLabel: string;
 }): string {
   const { tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order, paperWidthMm, copyLabel } = args;
-  const widthMm = paperWidthMm === 58 ? 58 : 80;
-  const compact = branch?.invoice_print_compact === true || widthMm === 58;
+  const nominalMm = paperWidthMm === 58 ? 58 : 80;
+  const printableMm = anchoImprimibleMm(nominalMm);
+  const compact = branch?.invoice_print_compact === true || nominalMm === 58;
   const baseFont = compact ? 9 : 11;
-  const innerWidthMm = Math.max(40, widthMm - 4);
 
   const copyHtml = renderCopyPOS({
     tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order,
@@ -921,14 +953,17 @@ function renderTicketHtml(args: {
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Ticket ${order.order_number}</title>
 <style>
-  @page { size: ${widthMm}mm auto; margin: 0; }
+  /* Sin @page { size }: ver la nota grande en anchoImprimibleMm() más abajo —
+     que la CAJA y lo que se le pide al driver sean EL MISMO número es lo que
+     cierra el hueco por el que se colaba esto. */
+  @page { margin: 0; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #fff; color: #000;
     font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
     font-size: ${baseFont}px; line-height: 1.4;
     -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .invoice-print {
-    width: ${innerWidthMm}mm; padding: 2mm;
+    width: ${printableMm}mm; padding: 2mm;
     /* El colchón de verdad ahora lo pone renderAndPrintNow al medir el
        alto real y sumarle 6mm antes de pedirle el pageSize al driver. Este
        se queda más chico, solo por si algún día vuelve a imprimirse sin
