@@ -642,19 +642,41 @@ async function printOrder(orderId: string): Promise<boolean> {
   // QR opcional si la sede lo configuró
   const qrDataUrl = branch?.invoice_qr_text ? await generateQRDataUrl(branch.invoice_qr_text) : null;
 
-  const html = renderTicketHtml({
-    tenantName: tenant?.name ?? "Inami",
-    tenantPhone: tenant?.whatsapp ?? "",
-    tenantLogo: logoDataUrl,
-    branch,
-    qrDataUrl,
-    order,
-    paperWidthMm: settings.paperWidthMm ?? 80,
-    copies: settings.copies ?? 1,
-  });
+  const copyLabels = labelsForCopies(settings.copies ?? 1);
+  /* Una impresión por copia, no un solo documento con page-break adentro.
+     Antes `renderTicketHtml` horneaba las N copias en un único HTML y se
+     llamaba a `print()` una vez — pero entonces había que darle a Chromium
+     un alto de página FIJO para las dos copias juntas, y "auto" no siempre
+     se respeta igual al imprimir a un printer físico que al exportar PDF.
+     Copia por copia, cada `print()` mide SU PROPIO contenido y le pide al
+     driver exactamente ese alto: ni corta lo que sobra de página ni deja
+     medio rollo de blanco. Ver la nota grande en `renderAndPrintNow`. */
+  let allOk = true;
+  for (const copyLabel of copyLabels) {
+    const html = renderTicketHtml({
+      tenantName: tenant?.name ?? "Inami",
+      tenantPhone: tenant?.whatsapp ?? "",
+      tenantLogo: logoDataUrl,
+      branch,
+      qrDataUrl,
+      order,
+      paperWidthMm: settings.paperWidthMm ?? 80,
+      copyLabel,
+    });
+    const ok = await renderAndPrint(html, settings.printerName!, settings.paperWidthMm ?? 80, settings.silentMode ?? true);
+    if (!ok) allOk = false;
+  }
+  return allOk;
+}
 
-  // copies=1 acá porque renderTicketHtml ya genera N páginas con page-break.
-  return await renderAndPrint(html, settings.printerName!, 1, settings.silentMode ?? true);
+// "TICKET" si es una sola copia; "COCINA"/"CLIENTE" si son dos —los dos
+// nombres que de verdad se usan en el mostrador—; "COPIA N/M" de ahí para
+// arriba, por si alguna sede pide más de dos.
+function labelsForCopies(copies: number): string[] {
+  const n = Math.max(1, Math.min(5, copies || 1));
+  if (n === 1) return ["** TICKET **"];
+  if (n === 2) return ["** COPIA COCINA **", "** COPIA CLIENTE **"];
+  return Array.from({ length: n }, (_, i) => `** COPIA ${i + 1}/${n} **`);
 }
 
 // Descarga el logo y lo convierte a data:URL. Cachea en memoria por URL para
@@ -697,6 +719,10 @@ async function printTestTicket(): Promise<boolean> {
     } catch {}
   }
 
+  // La prueba SIEMPRE imprime 1 sola copia, sin importar cuántas copias
+  // esté configurada la sede: es para validar que la impresora responde y
+  // se ve bien, no para gastar dos rollos de papel cada vez que alguien
+  // le da a "Probar impresión".
   const html = renderTicketHtml({
     tenantName,
     tenantPhone: "",
@@ -723,10 +749,9 @@ async function printTestTicket(): Promise<boolean> {
       created_at: new Date().toISOString(),
     },
     paperWidthMm: settings.paperWidthMm ?? 80,
-    copies: settings.copies ?? 1,
+    copyLabel: "** PRUEBA **",
   });
-  // copies=1 acá porque renderTicketHtml ya genera N páginas con page-break.
-  return await renderAndPrint(html, settings.printerName, 1, settings.silentMode ?? true);
+  return await renderAndPrint(html, settings.printerName, settings.paperWidthMm ?? 80, settings.silentMode ?? true);
 }
 
 // Render el HTML en una ventana invisible y dispara la impresión silent.
@@ -749,11 +774,13 @@ function enqueuePrint<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-async function renderAndPrint(html: string, printerName: string, copies: number, silent: boolean): Promise<boolean> {
-  return enqueuePrint(() => renderAndPrintNow(html, printerName, copies, silent));
+// `paperWidthMm` (no `copies`): desde el refactor a impresión-por-copia cada
+// llamada imprime UN documento de UNA copia — ver la nota en `printOrder`.
+async function renderAndPrint(html: string, printerName: string, paperWidthMm: number, silent: boolean): Promise<boolean> {
+  return enqueuePrint(() => renderAndPrintNow(html, printerName, paperWidthMm, silent));
 }
 
-async function renderAndPrintNow(html: string, printerName: string, copies: number, silent: boolean): Promise<boolean> {
+async function renderAndPrintNow(html: string, printerName: string, paperWidthMm: number, silent: boolean): Promise<boolean> {
   const win = new BrowserWindow({
     show: false,
     width: 800,
@@ -776,34 +803,66 @@ async function renderAndPrintNow(html: string, printerName: string, copies: numb
     // Margen extra para layout de @page después de que el browser midió las imgs
     await new Promise((r) => setTimeout(r, 200));
 
-    let allOk = true;
-    for (let i = 0; i < copies; i++) {
-      const ok = await new Promise<boolean>((resolve) => {
-        // Guarda de tiempo: si el driver de la térmica se cuelga, el callback
-        // de `print()` puede no volver nunca. Sin esto la cola entera se
-        // quedaría trancada y el local dejaría de imprimir en silencio.
-        const timer = setTimeout(() => {
-          console.error("Print timeout: la impresora no respondió en 30s");
-          resolve(false);
-        }, 30_000);
+    /* EL "PAGESIZE" QUE FALTABA — esto es lo que tenía la impresión saliendo
+       cortada (y a veces borrosa) incluso después de arreglar el HTML.
 
-        win.webContents.print(
-          {
-            silent,
-            deviceName: printerName,
-            printBackground: true,
-            margins: { marginType: "none" },
-          },
-          (success, errorType) => {
-            clearTimeout(timer);
-            if (!success) console.error(`Print error: ${errorType}`);
-            resolve(success);
-          },
-        );
-      });
-      if (!ok) allOk = false;
+       `win.webContents.print()` sin `pageSize` no lee el `@page { size: ...
+       auto }` del CSS: usa el tamaño de página que el DRIVER de la
+       impresora tenga configurado por defecto en el sistema operativo. Para
+       una térmica eso casi nunca es "80mm de ancho, alto libre" — suele ser
+       lo que quedó de fábrica (a veces Letter/A4). Con eso pasan dos cosas
+       a la vez, según el driver:
+         - Si el driver imprime literal a ese tamaño, todo lo que no entra
+           en el ancho real del rollo se PIERDE por el borde: la "cortada".
+         - Si el driver ESCALA el contenido para que quepa en un ancho que
+           no es el real, el texto sale reducido y blando: la "borrosa".
+
+       La solución no es adivinar un alto fijo —una comanda de un producto y
+       una de quince no miden lo mismo, y un alto fijo se queda corto en una
+       o desperdicia rollo en la otra—. Se MIDE el documento ya renderizado
+       (`document.body.scrollHeight`, en píxeles CSS a 96dpi, que es lo que
+       Chromium usa internamente) y ese alto exacto —con un colchón chico—
+       es lo que se le pide al driver como tamaño de página, en micrones
+       (Electron pide micrones: 1mm = 1000). El ancho es fijo por lo que la
+       sede configuró (58 u 80mm); el alto es SIEMPRE el del ticket real. */
+    let heightMicrons = 297_000; // ~A4 de alto, respaldo si la medición falla
+    try {
+      const heightPx = await win.webContents.executeJavaScript(
+        "Math.ceil(document.body.scrollHeight)",
+      );
+      if (typeof heightPx === "number" && heightPx > 0) {
+        const heightMm = (heightPx / 96) * 25.4; // 96 CSS px por pulgada
+        heightMicrons = Math.round((heightMm + 6) * 1000); // +6mm de colchón de corte
+      }
+    } catch (e) {
+      console.error("No se pudo medir el alto del ticket, usando respaldo:", e);
     }
-    return allOk;
+    const widthMicrons = Math.max(40, paperWidthMm) * 1000;
+
+    return await new Promise<boolean>((resolve) => {
+      // Guarda de tiempo: si el driver de la térmica se cuelga, el callback
+      // de `print()` puede no volver nunca. Sin esto la cola entera se
+      // quedaría trancada y el local dejaría de imprimir en silencio.
+      const timer = setTimeout(() => {
+        console.error("Print timeout: la impresora no respondió en 30s");
+        resolve(false);
+      }, 30_000);
+
+      win.webContents.print(
+        {
+          silent,
+          deviceName: printerName,
+          printBackground: true,
+          margins: { marginType: "none" },
+          pageSize: { width: widthMicrons, height: heightMicrons },
+        },
+        (success, errorType) => {
+          clearTimeout(timer);
+          if (!success) console.error(`Print error: ${errorType}`);
+          resolve(success);
+        },
+      );
+    });
   } finally {
     // Siempre se destruye, también si algo lanzó antes de imprimir: si no,
     // cada fallo dejaba una ventana oculta viva hasta cerrar la app.
@@ -813,13 +872,22 @@ async function renderAndPrintNow(html: string, printerName: string, copies: numb
   }
 }
 
-// HTML del ticket — formato POS v0.5.0
+// HTML del ticket — formato POS v0.6.0
 //
-// Port directo del nuevo diseño POS del proyecto principal
-// (src/lib/printTicket.ts → renderCopy). Usa Poppins (con fallback monospace),
-// header multilínea de la sede, divider ASCII, totales con border, footer
-// custom y QR opcional. Soporta múltiples copias con page-break entre ellas
-// para que la térmica corte automáticamente.
+// Port directo del formato del proyecto principal (src/lib/printTicket.ts →
+// renderCopy), incluyendo el arreglo de calidad de impresión de agosto 2026:
+// negro puro (una térmica no imprime grises), fuente de sistema (Poppins no
+// existe en esta ventana offscreen tampoco — misma razón que en el web:
+// nunca hay un <link> a Google Fonts, y esta app además imprime sin
+// internet la mayoría de las veces), tablas con ancho fijo que parten
+// palabras largas en vez de desbordar el papel.
+//
+// UNA sola copia por documento —ya no N con page-break adentro—: cada
+// llamada a `printOrder`/`printTestTicket` invoca esta función una vez por
+// copia y mide el alto real de CADA una antes de imprimir (ver
+// `renderAndPrintNow`). Iba todo en un documento porque así se podía pedir
+// UN alto de página para las dos copias juntas, pero ese alto combinado no
+// es el alto real de ninguna de las dos — de ahí salía la cortada.
 //
 // Datos que toma:
 // - branch.invoice_* (logo, legal_name, header, footer, QR) — gana sobre tenant
@@ -837,31 +905,18 @@ function renderTicketHtml(args: {
   qrDataUrl: string | null;
   order: any;
   paperWidthMm: number;
-  copies: number;
+  copyLabel: string;
 }): string {
-  const { tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order, paperWidthMm, copies } = args;
+  const { tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order, paperWidthMm, copyLabel } = args;
   const widthMm = paperWidthMm === 58 ? 58 : 80;
   const compact = branch?.invoice_print_compact === true || widthMm === 58;
   const baseFont = compact ? 9 : 11;
   const innerWidthMm = Math.max(40, widthMm - 4);
 
-  const safeCopies = Math.max(1, Math.min(5, copies || 1));
-  const labels = safeCopies === 1
-    ? ["** TICKET **"]
-    : safeCopies === 2
-      ? ["** COPIA COCINA **", "** COPIA CLIENTE **"]
-      : Array.from({ length: safeCopies }, (_, i) => `** COPIA ${i + 1}/${safeCopies} **`);
-
-  const copiesHtml = labels.map((lbl, i) => {
-    const isLast = i === labels.length - 1;
-    const copy = renderCopyPOS({
-      tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order,
-      copyLabel: lbl, baseFont,
-    });
-    return isLast
-      ? copy
-      : copy + '<div class="cut">— — — — — corte — — — — —</div><div class="page-break"></div>';
-  }).join("");
+  const copyHtml = renderCopyPOS({
+    tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order,
+    copyLabel, baseFont,
+  });
 
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Ticket ${order.order_number}</title>
@@ -869,15 +924,25 @@ function renderTicketHtml(args: {
   @page { size: ${widthMm}mm auto; margin: 0; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #fff; color: #000;
-    font-family: 'Poppins', system-ui, 'Courier New', monospace;
-    font-size: ${baseFont}px; line-height: 1.4; }
-  .invoice-print { width: ${innerWidthMm}mm; padding: 2mm; }
-  .invoice-print table { width: 100%; border-collapse: collapse; }
-  .invoice-print td, .invoice-print th { padding: 0; vertical-align: top; }
+    font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-size: ${baseFont}px; line-height: 1.4;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .invoice-print {
+    width: ${innerWidthMm}mm; padding: 2mm;
+    /* El colchón de verdad ahora lo pone renderAndPrintNow al medir el
+       alto real y sumarle 6mm antes de pedirle el pageSize al driver. Este
+       se queda más chico, solo por si algún día vuelve a imprimirse sin
+       pasar por esa medición. */
+    padding-bottom: 3mm;
+  }
+  .invoice-print table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .invoice-print td, .invoice-print th {
+    padding: 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;
+  }
   .invoice-print .ip-right { text-align: right; }
   .invoice-print .ip-center { text-align: center; }
   .invoice-print .ip-left { text-align: left; }
-  .invoice-print .ip-muted { color: #666; }
+  .invoice-print .ip-muted { color: #000; }
 
   .invoice-print .ip-divider {
     text-align: center; letter-spacing: 1px; color: #000; margin: 3px 0;
@@ -886,34 +951,33 @@ function renderTicketHtml(args: {
   .invoice-print .ip-logo-wrap { text-align: center; margin-bottom: 4px; }
   .invoice-print .ip-logo {
     max-height: ${compact ? 50 : 70}px; max-width: 90%; object-fit: contain;
-    filter: grayscale(1) contrast(1.3);
+    filter: grayscale(1) brightness(1.08) contrast(2.2);
   }
   .invoice-print .ip-header { text-align: center; line-height: 1.3; }
   .invoice-print .ip-header-primary { font-weight: 700; font-size: ${baseFont + 2}px; }
   .invoice-print .ip-header-line { font-size: ${baseFont - 1}px; }
-  .invoice-print .ip-legal { text-align: center; font-size: ${baseFont - 2}px; color: #444; margin-top: 2px; }
-  .invoice-print .ip-copy-label { text-align: center; font-size: ${baseFont - 2}px; color: #555; margin-top: 2px; letter-spacing: 1px; }
+  .invoice-print .ip-legal { text-align: center; font-size: ${baseFont - 2}px; color: #000; margin-top: 2px; }
+  .invoice-print .ip-copy-label { text-align: center; font-size: ${baseFont - 2}px; color: #000; margin-top: 2px; letter-spacing: 1px; font-weight: 600; }
   .invoice-print .ip-meta td, .invoice-print .ip-payment td { padding: 1px 0; }
+  .invoice-print .ip-cliente, .invoice-print .ip-addr { font-weight: 700; }
   .invoice-print .ip-addr { padding-top: 2px !important; line-height: 1.3; }
-  .invoice-print .ip-notes { font-size: ${baseFont - 1}px; padding: 2px 0; }
+  .invoice-print .ip-notes { font-size: ${baseFont - 1}px; padding: 2px 0; font-weight: 600; }
   .invoice-print .ip-items th {
-    font-weight: 700; padding-bottom: 3px; border-bottom: 1px dotted #888;
+    font-weight: 700; padding-bottom: 3px; border-bottom: 1px dotted #000;
   }
   .invoice-print .ip-items .ip-item-row td { padding: 2px 0; }
-  .invoice-print .ip-item-mods { font-size: ${baseFont - 2}px; color: #444; padding-left: 4px; }
-  .invoice-print .ip-variant { color: #555; font-size: ${baseFont - 1}px; }
+  .invoice-print .ip-item-name { font-weight: 700; }
+  .invoice-print .ip-item-mods { font-size: ${baseFont - 2}px; color: #000; padding-left: 4px; }
+  .invoice-print .ip-variant { color: #000; font-size: ${baseFont - 1}px; }
   .invoice-print .ip-totals td { padding: 1px 0; }
   .invoice-print .ip-total-row td { padding-top: 4px; border-top: 1px solid #000; font-size: ${baseFont + 1}px; }
   .invoice-print .ip-footer { text-align: center; margin-top: 4px; line-height: 1.4; font-size: ${baseFont - 1}px; }
   .invoice-print .ip-qr-wrap { text-align: center; margin-top: 6px; }
   .invoice-print .ip-qr-img { display: inline-block; width: ${compact ? 90 : 110}px; height: ${compact ? 90 : 110}px; }
-  .invoice-print .ip-qr-caption { font-size: ${baseFont - 2}px; color: #555; word-break: break-all; margin-top: 2px; }
-
-  .cut { border-top: 1px dashed #000; margin: 8px 0; text-align: center; font-size: ${baseFont - 2}px; color: #555; }
-  .page-break { break-after: page; page-break-after: always; height: 0; }
+  .invoice-print .ip-qr-caption { font-size: ${baseFont - 2}px; color: #000; word-break: break-all; margin-top: 2px; }
 </style></head>
 <body>
-${copiesHtml}
+${copyHtml}
 </body></html>`;
 }
 
@@ -999,7 +1063,7 @@ function renderCopyPOS(args: {
         <tbody>
           <tr><td>Pedido No.</td><td class="ip-right"><strong>${escapeHtml(dailyN)}</strong></td></tr>
           <tr><td>Fecha:</td><td class="ip-right">${escapeHtml(dateStr)}</td></tr>
-          <tr><td>Cliente:</td><td class="ip-right">${escapeHtml(order.customer_name || "------")}</td></tr>
+          <tr><td>Cliente:</td><td class="ip-right ip-cliente">${escapeHtml(order.customer_name || "------")}</td></tr>
           <tr><td>Teléfono:</td><td class="ip-right">${escapeHtml(order.customer_phone || "------")}</td></tr>
           <tr><td colspan="2" class="ip-addr">${escapeHtml(order.address || "")}${order.address_details ? "<br><span class='ip-muted'>" + escapeHtml(order.address_details) + "</span>" : ""}</td></tr>
         </tbody>
