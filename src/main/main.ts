@@ -1009,12 +1009,16 @@ function renderTicketHtml(args: {
   .invoice-print .ip-cliente, .invoice-print .ip-addr { font-weight: 700; }
   .invoice-print .ip-addr { padding-top: 2px !important; line-height: 1.3; }
   .invoice-print .ip-notes { font-size: ${baseFont - 1}px; padding: 2px 0; font-weight: 600; }
-  .invoice-print .ip-items th {
-    font-weight: 700; padding-bottom: 3px; border-bottom: 1px dotted #000;
-  }
-  .invoice-print .ip-items .ip-item-row td { padding: 2px 0; }
+  .invoice-print .ip-items { table-layout: fixed; }
+  .invoice-print .ip-items td { word-break: break-word; overflow-wrap: anywhere; }
+  /* Desglose estilo OlaClick: línea del producto en negrita con su total, y
+     debajo "N Unidad(es)" y "+N Adición" sangradas y un punto más chicas. */
+  .invoice-print .ip-items .ip-item-row td { padding: 3px 0 0 0; }
   .invoice-print .ip-item-name { font-weight: 700; }
-  .invoice-print .ip-item-mods { font-size: ${baseFont - 2}px; color: #000; padding-left: 4px; }
+  .invoice-print .ip-item-total { font-weight: 700; white-space: nowrap; }
+  .invoice-print .ip-item-sub td { font-size: ${baseFont - 1}px; padding: 0; }
+  .invoice-print .ip-item-sub td.ip-left { padding-left: 10px; }
+  .invoice-print .ip-item-sub td.ip-right { white-space: nowrap; }
   .invoice-print .ip-variant { color: #000; font-size: ${baseFont - 1}px; }
   .invoice-print .ip-totals td { padding: 1px 0; }
   .invoice-print .ip-total-row td { padding-top: 4px; border-top: 1px solid #000; font-size: ${baseFont + 1}px; }
@@ -1040,6 +1044,8 @@ function renderCopyPOS(args: {
 }): string {
   const { tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order, copyLabel } = args;
   const fmt = (n: number) => "$" + Math.round(Number(n)).toLocaleString("es-CO");
+  // Igual que fmt pero sin el "$" — para las sub-líneas del desglose.
+  const num = (n: number) => Math.round(Number(n)).toLocaleString("es-CO");
   const dailyN = order.tenant_order_number
     ? `P-${String(order.tenant_order_number).padStart(3, "0")}`
     : `#${order.order_number}`;
@@ -1066,20 +1072,33 @@ function renderCopyPOS(args: {
     ? `<div class="ip-legal">${escapeHtml(branch.legal_name)}${branch.tax_id ? " · NIT " + escapeHtml(branch.tax_id) : ""}</div>`
     : "";
 
+  // Desglose estilo OlaClick: línea del producto con su total, y debajo
+  // "N Unidad(es)" con el precio base y una línea "+N Adición" por cada
+  // adición con su valor a la derecha (0 si es gratis). Sin el valor, el
+  // cliente ve un total más alto que la suma de los productos y no puede
+  // cuadrarlo. En order_items, unit_price ya trae las adiciones sumadas
+  // (place_order: unit_price = base + variante + adiciones/unidad).
   const itemsHtml = (order.items || []).map((it: any) => {
-    const tops = Array.isArray(it.toppings) && it.toppings.length
-      ? `<div class="ip-item-mods">+ ${it.toppings.map((t: any) => escapeHtml(t.name || "")).join(", ")}</div>`
-      : "";
-    const noteHtml = it.notes ? `<div class="ip-item-mods">⚠ ${escapeHtml(it.notes)}</div>` : "";
-    const variant = it.variant_name ? ` <span class="ip-variant">(${escapeHtml(it.variant_name)})</span>` : "";
+    const qty = Number(it.quantity) || 1;
+    const adiciones = contarToppings(it.toppings);
+    const adicionPorUnidad = adiciones.reduce((s, a) => s + a.price * a.count, 0);
+    const baseUnit = Math.max(0, Number(it.unit_price || 0) - adicionPorUnidad);
+    const lineaTotal = Number(it.subtotal ?? Number(it.unit_price || 0) * qty);
+    const variant = it.variant_name ? ` (${escapeHtml(it.variant_name)})` : "";
+
+    const subRows = [
+      `<tr class="ip-item-sub"><td class="ip-left">${qty} Unidad(es)</td><td class="ip-right">${num(baseUnit * qty)}</td></tr>`,
+      ...adiciones.map((a) => {
+        const total = a.price * a.count * qty;
+        return `<tr class="ip-item-sub"><td class="ip-left">+${a.count * qty} ${escapeHtml(a.name)}</td><td class="ip-right">${a.price > 0 ? num(total) : "0"}</td></tr>`;
+      }),
+      ...(it.notes ? [`<tr class="ip-item-sub"><td class="ip-left" colspan="2">⚠ ${escapeHtml(it.notes)}</td></tr>`] : []),
+    ].join("");
+
     return `<tr class="ip-item-row">
-      <td class="ip-left ip-item-name">
-        <div>${escapeHtml(it.product_name)}${variant}</div>
-        ${tops}${noteHtml}
-      </td>
-      <td class="ip-center">${it.quantity}</td>
-      <td class="ip-right">${fmt(it.subtotal)}</td>
-    </tr>`;
+      <td class="ip-left ip-item-name">X${qty} ${escapeHtml(it.product_name)}${variant}</td>
+      <td class="ip-right ip-item-total">${fmt(lineaTotal)}</td>
+    </tr>${subRows}`;
   }).join("");
 
   const footerHtml = branch?.invoice_footer_message
@@ -1121,13 +1140,6 @@ function renderCopyPOS(args: {
       <div class="ip-divider">${"-".repeat(40)}</div>
 
       <table class="ip-items">
-        <thead>
-          <tr>
-            <th class="ip-left">Producto</th>
-            <th class="ip-center">Cant.</th>
-            <th class="ip-right">Precio</th>
-          </tr>
-        </thead>
         <tbody>${itemsHtml}</tbody>
       </table>
 
@@ -1136,7 +1148,7 @@ function renderCopyPOS(args: {
       <table class="ip-totals">
         <tbody>
           <tr><td>Subtotal</td><td class="ip-right">${fmt(order.subtotal)}</td></tr>
-          ${order.delivery_fee > 0 ? `<tr><td>Domicilio</td><td class="ip-right">${fmt(order.delivery_fee)}</td></tr>` : ""}
+          ${order.delivery_fee > 0 ? `<tr><td>Precio de entrega</td><td class="ip-right">${fmt(order.delivery_fee)}</td></tr>` : ""}
           ${order.courier_tip > 0 ? `<tr><td>Propina domi</td><td class="ip-right">${fmt(order.courier_tip)}</td></tr>` : ""}
           <tr class="ip-total-row"><td><strong>TOTAL</strong></td><td class="ip-right"><strong>${fmt(order.total)}</strong></td></tr>
         </tbody>
@@ -1207,6 +1219,28 @@ function escapeHtml(s: any): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/* Agrupa las adiciones de una línea conservando el orden en que el cliente
+ * las armó: dos iguales al mismo precio salen como "Nombre ×2". El precio
+ * viene del JSONB order_items.toppings ([{topping_id, name, price}]); 0 si
+ * la línea no lo traía. */
+function contarToppings(toppings: any[]): Array<{ name: string; price: number; count: number }> {
+  const orden: string[] = [];
+  const acc = new Map<string, { name: string; price: number; count: number }>();
+  for (const t of toppings || []) {
+    const name = String((t && typeof t === "object" ? t.name : t) ?? "").trim();
+    if (!name) continue;
+    const raw = t && typeof t === "object" ? t.price : 0;
+    const price = typeof raw === "number" ? raw : parseFloat(raw) || 0;
+    const key = `${name}::${price > 0 ? price : 0}`;
+    if (!acc.has(key)) {
+      orden.push(key);
+      acc.set(key, { name, price: price > 0 ? price : 0, count: 0 });
+    }
+    acc.get(key)!.count += 1;
+  }
+  return orden.map((k) => acc.get(k)!);
 }
 
 // ──────────────────────────────────────────────────────
