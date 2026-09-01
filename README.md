@@ -61,11 +61,17 @@ entorno y no hay que recompilar y redistribuir el instalador a cada local.
 
 ## Cómo imprime
 
-1. Se suscribe por realtime a los pedidos del tenant.
-2. Cuando entra uno, arma el HTML del ticket con la cabecera de la sede (logo,
-   razón social y NIT salen de `branches`; si están vacíos usa los del tenant).
-3. Lo manda a la impresora seleccionada con `silent: true`, sin diálogo.
-4. Marca el trabajo como `printed` o `failed` en `print_jobs`.
+1. Se suscribe por realtime al tenant. Un **pedido nuevo** (o el momento en que
+   se le confirma el pago) solo dispara la campana y la notificación —
+   **no imprime**: la comanda sale cuando el pedido está listo para empacar.
+2. Imprime cuando aparece una fila en **`print_jobs`**. La encola la base al
+   pasar el pedido a `ready` (disparador `trg_enqueue_comanda_al_empacar` —
+   respeta `print_settings.auto_print` y no imprime pedidos sin pago aprobado),
+   o la crea el botón 🖨️ del panel para una reimpresión a demanda.
+3. Arma el HTML del ticket con la cabecera de la sede (logo, razón social y NIT
+   salen de `branches`; si están vacíos usa los del tenant).
+4. Lo manda a la impresora seleccionada con `silent: true`, sin diálogo, y marca
+   el trabajo como `printed` o `failed` en `print_jobs`.
 
 ## Si no imprime
 

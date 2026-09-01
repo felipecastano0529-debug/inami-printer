@@ -1,7 +1,12 @@
 // Inami Printer — Electron main process.
-// Vive en el system tray. Suscribe a Supabase Realtime de orders del tenant
-// y, cuando llega un pedido nuevo (INSERT), abre una ventana invisible con
-// el HTML del ticket y la imprime silently al printer seleccionado.
+// Vive en el system tray. Suscribe a Supabase Realtime del tenant:
+//   - orders (INSERT / pago confirmado) → SOLO avisa (campana + notificación).
+//     NO imprime: la comanda sale cuando el pedido está "listo para empacar",
+//     no al entrar ni al pagar.
+//   - print_jobs INSERT → arma el HTML del ticket y lo imprime silently. Esa
+//     fila la encola la base al pasar el pedido a 'ready' (disparador
+//     `trg_enqueue_comanda_al_empacar`, respeta `print_settings.auto_print` y
+//     el candado "sin pago no se imprime"), o el botón 🖨️ del panel.
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, Notification, powerMonitor } from "electron";
 import path from "node:path";
@@ -589,10 +594,14 @@ async function onNewOrder(sb: any, orderHeader: { id: string }) {
     markNotified(orderHeader.id);
   }
 
-  const ok = await printOrder(orderHeader.id);
-  // Solo marcar como impreso si el spooler aceptó el job. Si falló, dejamos
-  // el id sin marcar para que el próximo catch-up lo reintente.
-  if (ok) markPrinted(orderHeader.id);
+  // Acá NO se imprime. Imprimir al entrar (o al pagar) el pedido sacaba la
+  // comanda antes de que la cocina lo tuviera listo, y encima salía OTRA VEZ
+  // cuando la base encolaba el `print_jobs` al pasar a 'ready' —que en Inami
+  // coincide con asignar el domiciliario—, porque `processPrintJob` no mira
+  // `printedIds`. De ahí el "reimprime al asignar". La comanda sale una sola
+  // vez, por el `print_jobs` de "listo para empacar" (o el botón 🖨️).
+  markPrinted(orderHeader.id); // marca "visto": que el catch-up no re-avise
+  return true;
 }
 
 function showNewOrderNotification(meta: any) {
