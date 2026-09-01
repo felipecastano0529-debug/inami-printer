@@ -374,6 +374,9 @@ async function startRealtime() {
         if (!order) return;
         if (alreadyPrinted(order.id) || inFlight.has(order.id)) return;
         if (order.status === "cancelled") return;
+        // Pago en línea sin confirmar: se ignora. Lo imprime el UPDATE de
+        // abajo, cuando entre la plata.
+        if (order.pago_pendiente) return;
         inFlight.add(order.id);
         try {
           await onNewOrder(sb, order);
@@ -381,6 +384,36 @@ async function startRealtime() {
           console.error("Print failed:", e);
         } finally {
           inFlight.delete(order.id);
+        }
+      },
+    )
+    /* El pago entra: ESE es el momento de imprimir.
+     *
+     * Para el mostrador, un pedido pagado en línea "llega" cuando se confirma
+     * la plata, no cuando el cliente le da a pagar. `pago_pendiente` pasando de
+     * true a false es exactamente ese instante. */
+    .on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "orders",
+        filter: `tenant_id=eq.${session.tenantId}`,
+      },
+      async (payload: any) => {
+        const nuevo = payload.new;
+        const viejo = payload.old;
+        if (!nuevo || !viejo) return;
+        if (!viejo.pago_pendiente || nuevo.pago_pendiente) return;   // no es el paso a pagado
+        if (nuevo.status === "cancelled") return;
+        if (alreadyPrinted(nuevo.id) || inFlight.has(nuevo.id)) return;
+        inFlight.add(nuevo.id);
+        try {
+          await onNewOrder(sb, nuevo);
+        } catch (e) {
+          console.error("Print on payment failed:", e);
+        } finally {
+          inFlight.delete(nuevo.id);
         }
       },
     )
@@ -441,6 +474,7 @@ async function catchUpMissedOrders(sb: any) {
     .from("orders")
     .select("id, created_at, status")
     .eq("tenant_id", session.tenantId)
+    .eq("pago_pendiente", false)
     .gt("created_at", since)
     .neq("status", "cancelled")
     .order("created_at", { ascending: true })
@@ -517,9 +551,29 @@ async function onNewOrder(sb: any, orderHeader: { id: string }) {
   // Trae info mínima para la notificación
   const { data: meta } = await sb
     .from("orders")
-    .select("order_number, tenant_order_number, customer_name, total")
+    .select("order_number, tenant_order_number, customer_name, total, pago_pendiente")
     .eq("id", orderHeader.id)
     .maybeSingle();
+
+  /* Sin pago confirmado no se imprime. NADA.
+   *
+   * Esta guarda va acá y no solo en quien llama, porque al plugin le llegan
+   * los pedidos por TRES caminos distintos: la suscripción en tiempo real, el
+   * sondeo de respaldo cada 25 s y el catch-up al reconectar. Poner el filtro
+   * en cada uno es olvidarse de uno; acá pasan los tres.
+   *
+   * El pedido pagado en línea existe en `orders` desde antes de que el cliente
+   * pase por la pasarela — hay que tener a qué acreditarle la plata. Pero
+   * hasta que entre, no es un pedido: es un intento. Si sale el ticket, en el
+   * mostrador hay un papel que dice «prepárame» de algo que nadie pagó.
+   *
+   * Cuando el pago entra, `pago_pendiente` pasa a false y el manejador de
+   * UPDATE del canal lo imprime entonces. El ticket sale una sola vez, en el
+   * momento correcto. */
+  if ((meta as any)?.pago_pendiente) {
+    console.log(`Pedido ${orderHeader.id}: pago sin confirmar, no se imprime todavía.`);
+    return false;
+  }
 
   // El aviso va UNA vez por pedido. Antes sonaba antes de imprimir y sin
   // registrar nada: si la impresión fallaba —impresora sin elegir, apagada,
