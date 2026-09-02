@@ -1082,6 +1082,10 @@ function renderTicketHtml(args: {
   .invoice-print .ip-item-sub td { font-size: ${baseFont - 1}px; padding: 0; }
   .invoice-print .ip-item-sub td.ip-left { padding-left: 10px; }
   .invoice-print .ip-item-sub td.ip-right { white-space: nowrap; }
+  /* Lo que hay que quitar del plato. Al tamaño del nombre del producto y en
+     negrita: es la línea que, si no se lee, hace que el pedido se rehaga. */
+  .invoice-print .ip-item-quitar td { font-weight: 700; color: #000;
+    font-size: ${baseFont}px; padding: 2px 0 2px 10px; }
   .invoice-print .ip-variant { color: #000; font-size: ${baseFont - 1}px; }
   .invoice-print .ip-totals td { padding: 1px 0; }
   .invoice-print .ip-total-row td { padding-top: 4px; border-top: 1px solid #000; font-size: ${baseFont + 1}px; }
@@ -1149,12 +1153,24 @@ function renderCopyPOS(args: {
     const lineaTotal = Number(it.subtotal ?? Number(it.unit_price || 0) * qty);
     const variant = it.variant_name ? ` (${escapeHtml(it.variant_name)})` : "";
 
+    /* Lo que se QUITA sale aparte, en su propia línea y en mayúsculas. Con el
+       "+N" de las adiciones, un "+1 Sin queso" se lee como si le hubieran
+       AÑADIDO algo llamado «Sin queso» — y quien prepara sirve el plato
+       completo. Tampoco lleva valor: no se cobra por quitar. */
+    const quitar = adiciones.filter((a) => a.quitar);
+    const suman = adiciones.filter((a) => !a.quitar);
+
     const subRows = [
       `<tr class="ip-item-sub"><td class="ip-left">${qty} Unidad(es)</td><td class="ip-right">${num(baseUnit * qty)}</td></tr>`,
-      ...adiciones.map((a) => {
+      ...suman.map((a) => {
         const total = a.price * a.count * qty;
         return `<tr class="ip-item-sub"><td class="ip-left">+${a.count * qty} ${escapeHtml(a.name)}</td><td class="ip-right">${a.price > 0 ? num(total) : "0"}</td></tr>`;
       }),
+      ...(quitar.length
+        ? [`<tr class="ip-item-sub ip-item-quitar"><td class="ip-left" colspan="2">** ${escapeHtml(
+            quitar.map((a) => a.name.toUpperCase()).join(", "),
+          )} **</td></tr>`]
+        : []),
       ...(it.notes ? [`<tr class="ip-item-sub"><td class="ip-left" colspan="2">⚠ ${escapeHtml(it.notes)}</td></tr>`] : []),
     ].join("");
 
@@ -1290,9 +1306,11 @@ function escapeHtml(s: any): string {
  * las armó: dos iguales al mismo precio salen como "Nombre ×2". El precio
  * viene del JSONB order_items.toppings ([{topping_id, name, price}]); 0 si
  * la línea no lo traía. */
-function contarToppings(toppings: any[]): Array<{ name: string; price: number; count: number }> {
+function contarToppings(
+  toppings: any[],
+): Array<{ name: string; price: number; count: number; quitar: boolean }> {
   const orden: string[] = [];
-  const acc = new Map<string, { name: string; price: number; count: number }>();
+  const acc = new Map<string, { name: string; price: number; count: number; quitar: boolean }>();
   for (const t of toppings || []) {
     const name = String((t && typeof t === "object" ? t.name : t) ?? "").trim();
     if (!name) continue;
@@ -1301,11 +1319,26 @@ function contarToppings(toppings: any[]): Array<{ name: string; price: number; c
     const key = `${name}::${price > 0 ? price : 0}`;
     if (!acc.has(key)) {
       orden.push(key);
-      acc.set(key, { name, price: price > 0 ? price : 0, count: 0 });
+      acc.set(key, { name, price: price > 0 ? price : 0, count: 0, quitar: esQuitar(t) });
     }
     acc.get(key)!.count += 1;
   }
   return orden.map((k) => acc.get(k)!);
+}
+
+/* ¿Esta adición es en realidad un «quítame esto»? «Sin queso», «Queso aparte».
+ *
+ * Manda la marca del grupo (`topping_groups.is_removal`), que desde la
+ * migración `20260902100000` viaja estampada en cada adición del pedido: es lo
+ * único que reconoce «Queso aparte», que quita el queso y no empieza por
+ * «Sin». El nombre es el respaldo para los pedidos anteriores a esa fecha.
+ *
+ * Mismo criterio que `esQuitar()` en app/src/lib/regalo.ts — si cambia allá,
+ * cambia aquí. */
+function esQuitar(t: any): boolean {
+  if (t && typeof t === "object" && t.is_removal === true) return true;
+  const name = String((t && typeof t === "object" ? t.name : t) ?? "");
+  return /^\s*sin\b/i.test(name);
 }
 
 // ──────────────────────────────────────────────────────
