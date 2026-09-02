@@ -87,6 +87,10 @@ function alreadyNotified(orderId: string): boolean {
 let tray: Tray | null = null;
 let configWindow: BrowserWindow | null = null;
 let supabaseChannel: any = null;
+/* Canal aparte, solo para la cola de impresión. Ver el comentario largo donde
+   se crea: la comanda es lo único que no se puede perder, así que no comparte
+   canal con el ruido de los pedidos. */
+let supabaseChannelImpresion: any = null;
 let supabaseClient: any = null;          // cliente compartido (autoRefresh activo)
 let refreshTimer: NodeJS.Timeout | null = null;
 let pollingTimer: NodeJS.Timeout | null = null;
@@ -357,6 +361,10 @@ async function startRealtime() {
     try { supabaseChannel.unsubscribe(); } catch {}
     supabaseChannel = null;
   }
+  if (supabaseChannelImpresion) {
+    try { supabaseChannelImpresion.unsubscribe(); } catch {}
+    supabaseChannelImpresion = null;
+  }
 
   const sb = await getSupabase();
   if (!sb) return;
@@ -392,38 +400,31 @@ async function startRealtime() {
         }
       },
     )
-    /* El pago entra: ESE es el momento de imprimir.
+    /* Acá había un oyente de UPDATE sobre `orders` para imprimir cuando
+     * entraba el pago. Se quita, y no es solo que sobre: HACÍA DAÑO.
      *
-     * Para el mostrador, un pedido pagado en línea "llega" cuando se confirma
-     * la plata, no cuando el cliente le da a pagar. `pago_pendiente` pasando de
-     * true a false es exactamente ese instante. */
-    .on(
-      "postgres_changes",
-      {
-        event: "UPDATE",
-        schema: "public",
-        table: "orders",
-        filter: `tenant_id=eq.${session.tenantId}`,
-      },
-      async (payload: any) => {
-        const nuevo = payload.new;
-        const viejo = payload.old;
-        if (!nuevo || !viejo) return;
-        if (!viejo.pago_pendiente || nuevo.pago_pendiente) return;   // no es el paso a pagado
-        if (nuevo.status === "cancelled") return;
-        if (alreadyPrinted(nuevo.id) || inFlight.has(nuevo.id)) return;
-        inFlight.add(nuevo.id);
-        try {
-          await onNewOrder(sb, nuevo);
-        } catch (e) {
-          console.error("Print on payment failed:", e);
-        } finally {
-          inFlight.delete(nuevo.id);
-        }
-      },
-    )
-    // Escuchar la cola de impresión: cuando el cajero toca "Imprimir" en
-    // la web, llega un job aquí y lo procesamos sin diálogo.
+     * `orders` replica la fila completa, así que ese oyente recibía un evento
+     * por CADA cambio de CADA pedido — estado, domiciliario, notas, todo — en
+     * el mismo canal por donde llegan las órdenes de impresión. Ese ruido
+     * competía con ellas y el plugin empezó a saltarse comandas: se encolaban
+     * y nadie las recogía. Antes de agregarlo, esto funcionaba bien.
+     *
+     * Y sobra: cuando entra la plata, el disparador `enqueue_comanda_al_empacar`
+     * de la base crea la orden de impresión, y esa llega por el canal de
+     * `print_jobs` de abajo. Un solo camino, el de siempre. */
+    .subscribe(async (status: string) => {
+      console.log(`Realtime pedidos: ${status}`);
+    });
+
+  /* La cola de impresión va en SU PROPIO canal.
+   *
+   * Antes compartía canal con los eventos de pedidos, y cuando esos se
+   * disparaban en ráfaga —hora pico, varios pedidos moviéndose a la vez— las
+   * órdenes de impresión se perdían entre el ruido. La comanda es lo único de
+   * este plugin que no se puede perder: si no sale el papel, la cocina no
+   * sabe qué hacer. Se le da un canal para ella sola. */
+  supabaseChannelImpresion = sb
+    .channel(`printer-jobs-${session.tenantId}-${Math.random().toString(36).slice(2, 8)}`)
     .on(
       "postgres_changes",
       {
@@ -655,6 +656,10 @@ async function stopRealtime() {
   if (supabaseChannel) {
     try { supabaseChannel.unsubscribe(); } catch {}
     supabaseChannel = null;
+  }
+  if (supabaseChannelImpresion) {
+    try { supabaseChannelImpresion.unsubscribe(); } catch {}
+    supabaseChannelImpresion = null;
   }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   // El polling de respaldo también se apaga: si no, seguía despertando cada
