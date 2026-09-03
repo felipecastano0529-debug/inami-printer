@@ -1087,6 +1087,10 @@ function renderTicketHtml(args: {
   .invoice-print .ip-item-sub td { font-size: ${baseFont - 1}px; padding: 0; }
   .invoice-print .ip-item-sub td.ip-left { padding-left: 10px; }
   .invoice-print .ip-item-sub td.ip-right { white-space: nowrap; }
+  /* La hora de un pedido programado. Centrada, en negrita y más grande que
+     todo lo de alrededor: se lee antes de empezar a prepararlo, no después. */
+  .invoice-print .ip-programado { text-align: center; font-weight: 700; color: #000;
+    font-size: ${baseFont + 2}px; padding: 4px 0; letter-spacing: .02em; }
   /* Lo que hay que quitar del plato. Al tamaño del nombre del producto y en
      negrita: es la línea que, si no se lee, hace que el pedido se rehaga. */
   .invoice-print .ip-item-quitar td { font-weight: 700; color: #000;
@@ -1201,6 +1205,21 @@ function renderCopyPOS(args: {
     day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit",
   });
 
+  /* Un pedido programado tiene que gritarlo en el papel. Este tiquete llega a
+     la cocina 30 minutos antes de su hora, mezclado con los de ahora mismo: si
+     no dice a qué hora va, se prepara y sale con el primer domiciliario, media
+     hora antes de lo que el cliente pidió.
+     Mismo texto y mismo sitio que en el tiquete del navegador
+     (app/src/lib/printTicket.ts) — si cambia allá, cambia aquí. */
+  const horaProgramada = (() => {
+    if (!order.scheduled_for) return null;
+    const cuando = new Date(order.scheduled_for);
+    if (Number.isNaN(+cuando)) return null;
+    const hora = cuando.toLocaleTimeString("es-CO", { hour: "numeric", minute: "2-digit" });
+    const esHoy = cuando.toDateString() === new Date().toDateString();
+    return esHoy ? hora : `${cuando.toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${hora}`;
+  })();
+
   return `
     <div class="invoice-print">
       ${logoHtml}
@@ -1212,6 +1231,9 @@ function renderCopyPOS(args: {
       <table class="ip-meta">
         <tbody>
           <tr><td>Pedido No.</td><td class="ip-right"><strong>${escapeHtml(dailyN)}</strong></td></tr>
+          ${horaProgramada
+            ? `<tr><td colspan="2" class="ip-programado">** ENTREGAR A LAS ${escapeHtml(horaProgramada)} **</td></tr>`
+            : ""}
           <tr><td>Fecha:</td><td class="ip-right">${escapeHtml(dateStr)}</td></tr>
           <tr><td>Cliente:</td><td class="ip-right ip-cliente">${escapeHtml(order.customer_name || "------")}</td></tr>
           <tr><td>Teléfono:</td><td class="ip-right">${escapeHtml(order.customer_phone || "------")}</td></tr>
