@@ -1311,12 +1311,19 @@ function paymentStatusLabel(s: string): string {
   }
 }
 
+// El enum `payment_method` de Postgres tiene SEIS valores:
+// cash | wompi | bold | card_on_delivery | nequi | transfer.
+// Faltaban los dos últimos y caían al `default`, que imprime el valor crudo:
+// el tiquete decía literalmente «transfer». No es un caso raro — nequi y
+// transfer juntos son casi la mitad de los pedidos de Inami.
 function paymentLabel(m: string): string {
   switch (m) {
     case "cash": return "Efectivo contra entrega";
     case "card_on_delivery": return "Datáfono al recibir";
     case "wompi": return "Pago en línea (Wompi)";
     case "bold": return "Pago en línea (Bold)";
+    case "nequi": return "Nequi";
+    case "transfer": return "Transferencia";
     default: return m;
   }
 }
