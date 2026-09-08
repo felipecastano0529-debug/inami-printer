@@ -599,7 +599,7 @@ async function onNewOrder(sb: any, orderHeader: { id: string }) {
   // Trae info mínima para la notificación
   const { data: meta } = await sb
     .from("orders")
-    .select("order_number, tenant_order_number, customer_name, total, pago_pendiente")
+    .select("numero_visible, order_number, tenant_order_number, customer_name, total, pago_pendiente")
     .eq("id", orderHeader.id)
     .maybeSingle();
 
@@ -647,11 +647,29 @@ async function onNewOrder(sb: any, orderHeader: { id: string }) {
   return true;
 }
 
+/* El número de pedido, tal como se dice en voz alta.
+ *
+ * El dueño lo cazó en la primera comanda: «el pedido en el panel dice TEQ-08
+ * pero en la factura dice P-029». El plugin armaba el número por su cuenta con
+ * la numeración vieja del NEGOCIO, mientras el tablero ya usaba la de la sede.
+ * Un cliente que llama por «su pedido P-029» no existe en ningún mostrador.
+ *
+ * `numero_visible` lo estampa la base al crear el pedido (migración
+ * 20260908020000). Los respaldos son para los pedidos de antes de ese cambio,
+ * que todavía se pueden reimprimir desde el historial. */
+function numeroDePedido(o: {
+  numero_visible?: string | null;
+  tenant_order_number?: number | null;
+  order_number?: number | null;
+}): string {
+  if (o.numero_visible) return o.numero_visible;
+  if (o.tenant_order_number != null) return `P-${String(o.tenant_order_number).padStart(3, "0")}`;
+  return `#${o.order_number ?? "—"}`;
+}
+
 function showNewOrderNotification(meta: any) {
   if (!Notification.isSupported()) return;
-  const dailyN = meta.tenant_order_number
-    ? `P-${String(meta.tenant_order_number).padStart(3, "0")}`
-    : `#${meta.order_number}`;
+  const dailyN = numeroDePedido(meta);
   const n = new Notification({
     title: `🛎️ Nuevo pedido ${dailyN}`,
     body: `${meta.customer_name ?? ""} · $${Math.round(Number(meta.total)).toLocaleString("es-CO")}`,
@@ -842,6 +860,7 @@ async function printTestTicket(): Promise<boolean> {
     order: {
       order_number: 9999,
       tenant_order_number: 999,
+      numero_visible: "TEST-01",
       customer_name: "Cliente de prueba",
       customer_phone: "+57 300 000 0000",
       address: "Cra 0 # 0-0",
@@ -1088,7 +1107,7 @@ function renderTicketHtml(args: {
   });
 
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>Ticket ${order.order_number}</title>
+<html><head><meta charset="utf-8"><title>Ticket ${numeroDePedido(order)}</title>
 <style>
   /* Sin @page { size }: ver la nota grande en anchoImprimibleMm() más abajo —
      que la CAJA y lo que se le pide al driver sean EL MISMO número es lo que
@@ -1191,9 +1210,7 @@ function renderCopyPOS(args: {
   const fmt = (n: number) => "$" + Math.round(Number(n)).toLocaleString("es-CO");
   // Igual que fmt pero sin el "$" — para las sub-líneas del desglose.
   const num = (n: number) => Math.round(Number(n)).toLocaleString("es-CO");
-  const dailyN = order.tenant_order_number
-    ? `P-${String(order.tenant_order_number).padStart(3, "0")}`
-    : `#${order.order_number}`;
+  const dailyN = numeroDePedido(order);
 
   const showLogo = branch?.invoice_print_logo !== false;
   const logoHtml = showLogo && tenantLogo
@@ -1533,6 +1550,7 @@ ipcMain.handle("notification:test", async () => {
   showNewOrderNotification({
     order_number: 9999,
     tenant_order_number: 999,
+    numero_visible: "TEST-01",
     customer_name: "Cliente de prueba",
     total: 35000,
   });
