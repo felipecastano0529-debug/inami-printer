@@ -522,6 +522,11 @@ async function catchUpMissedOrders(sb: any) {
   }
 
   // 2. Print jobs pendientes (reimpresión solicitada desde la web)
+  try {
+    await sb.rpc("liberar_impresiones_colgadas");
+  } catch (e) {
+    console.error("No se pudieron liberar impresiones colgadas:", e);
+  }
   const { data: jobs, error: jobsErr } = await sb
     .from("print_jobs")
     .select("*")
@@ -545,6 +550,23 @@ async function processPrintJob(sb: any, job: any) {
   if (inFlight.has(`job-${job.id}`)) return;
   inFlight.add(`job-${job.id}`);
   try {
+    /* Reclamar antes de imprimir. Dos impresoras conectadas reciben el mismo
+       INSERT por realtime; sin esto las dos sacan el mismo ticket. El UPDATE
+       va condicionado a que el trabajo siga `pending`, así que solo una lo
+       consigue y la otra se retira sin imprimir. */
+    const { data: reclamado, error: errReclamo } = await sb
+      .from("print_jobs")
+      .update({ status: "printing" })
+      .eq("id", job.id)
+      .eq("status", "pending")
+      .select("id")
+      .maybeSingle();
+    if (errReclamo) throw errReclamo;
+    if (!reclamado) {
+      console.log(`Print job ${job.id}: se lo llevó otra impresora`);
+      return;
+    }
+
     console.log(`Procesando print job ${job.id} → order ${job.order_id}`);
     const ok = await printOrder(job.order_id);
     await sb

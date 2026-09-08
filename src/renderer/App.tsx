@@ -30,6 +30,7 @@ export default function App() {
   const [printers, setPrinters] = useState<any[]>([]);
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [sedes, setSedes] = useState<Sede[]>([]);
+  const [roles, setRoles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Error de la carga de restaurantes, separado del de login: antes se tragaba
@@ -73,7 +74,7 @@ export default function App() {
       });
       const { data: roles, error } = await sb
         .from("user_roles")
-        .select("tenant_id, role, tenant:tenants(id, name)")
+        .select("tenant_id, role, branch_id, tenant:tenants(id, name)")
         .not("tenant_id", "is", null);
 
       if (error) {
@@ -91,6 +92,7 @@ export default function App() {
         }
       }
       setTenants(list);
+      setRoles((roles as any[]) ?? []);
       if (list.length === 0) {
         setTenantsError("Tu cuenta no tiene ningún restaurante asignado.");
       }
@@ -137,12 +139,36 @@ export default function App() {
     const newSession = { ...session, tenantId: t.id, tenantName: t.name };
     const ses = await window.api.setSession(newSession);
     setSession(ses);
-    await loadSedes(t.id);
+    const lista = (await loadSedes(t.id)) ?? [];
+    const mia = sedeDeLaCuenta(t.id);
+    if (mia) {
+      const b = lista.find((x) => x.id === mia);
+      if (b) await handlePickSede(b);
+    }
   }
 
-  /* Las sedes del restaurante. Si hay más de una hay que preguntar cuál
-     atiende esta impresora: si no, la máquina del mostrador de una sede
-     escupe también las comandas de las otras. */
+  /* La sede de ESTA cuenta.
+   *
+   * El dueño reportó: «pongo las credenciales de la sede Tequendama y dice que
+   * el restaurante es Inami Ice Cream Shop». Tenía razón en la queja de fondo:
+   * el plugin solo sabía de restaurantes, así que la impresora de una sede
+   * imprimía las comandas de las tres.
+   *
+   * La cuenta de cada sede ya trae su sede en `user_roles.branch_id`. Si la
+   * tiene, se fija sola y no se pregunta nada: se entra con las credenciales de
+   * la sede y esa impresora queda atada a ella. Solo se pregunta cuando la
+   * cuenta manda en todas —el dueño—, que es cuando de verdad hay que elegir. */
+  function sedeDeLaCuenta(tenantId: string): string | null {
+    const mios = roles.filter((r) => r.tenant_id === tenantId);
+    const conSede = [...new Set(mios.map((r) => r.branch_id).filter(Boolean))];
+    return conSede.length === 1 && !mios.some((r) => r.role === "owner" || !r.branch_id)
+      ? (conSede[0] as string)
+      : null;
+  }
+
+  /* Las sedes del restaurante. Si hay más de una y la cuenta no dice cuál,
+     hay que preguntar: si no, la máquina del mostrador de una sede escupe
+     también las comandas de las otras. */
   async function loadSedes(
     tenantId: string,
     cfg = config,
@@ -157,9 +183,21 @@ export default function App() {
       const { data } = await sb
         .from("branches").select("id, name")
         .eq("tenant_id", tenantId).eq("is_active", true).order("name");
-      setSedes((data as Sede[]) ?? []);
+      const lista = (data as Sede[]) ?? [];
+      setSedes(lista);
+      return lista;
     } catch { setSedes([]); }
+    return [];
   }
+
+  useEffect(() => {
+    if (!session?.tenantId || session.branchId || !roles.length || !sedes.length) return;
+    const mia = sedeDeLaCuenta(session.tenantId);
+    if (!mia) return;
+    const b = sedes.find((x) => x.id === mia);
+    if (b) void handlePickSede(b);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roles, sedes, session?.tenantId, session?.branchId]);
 
   async function handlePickSede(b: Sede | null) {
     const ses = await window.api.setSession({
@@ -277,7 +315,7 @@ export default function App() {
             </button>
           </span>
         </Row>
-        {sedes.length > 1 && (
+        {(sedes.length > 1 || session.branchName) && (
           <Row>
             <Label>Sede</Label>
             <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
