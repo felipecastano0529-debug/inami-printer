@@ -738,59 +738,83 @@ async function printOrder(orderId: string): Promise<boolean> {
   const sb = await getSupabase();
   if (!sb) return false;
 
-  const { data: order, error } = await sb
-    .from("orders")
-    .select("*, items:order_items(product_name, variant_name, quantity, unit_price, subtotal, toppings, notes)")
-    .eq("id", orderId)
-    .maybeSingle();
-  if (error || !order) {
-    console.error("Order fetch failed:", error);
-    return false;
+  /* El ticket lo arma LA PLATAFORMA (edge function `ticket-html`), no esta
+   * máquina. El dueño lo pidió así después de que la comanda saliera con el
+   * número viejo: «todo debe ir desde la plataforma para que no tengamos
+   * errores; el plugin lo que hace es recibir la factura y la imprime».
+   *
+   * Tenía razón, y el síntoma lo probaba: la plantilla estaba duplicada aquí,
+   * así que el tablero decía «TEQ-08» y el papel «P-029» — y para arreglarlo
+   * había que publicar un instalador y que cada sede lo instalara. Ahora un
+   * cambio de formato, de teléfono o de numeración se despliega una vez y sale
+   * bien en las tres sedes esa misma noche, sin tocar nada aquí.
+   *
+   * Va con la sesión del usuario, así que la RLS sigue mandando: esta
+   * impresora no puede pedir el ticket de otra sede ni queriendo. */
+  let tickets: string[] | null = null;
+  try {
+    const { data, error: errFn } = await sb.functions.invoke("ticket-html", {
+      body: {
+        order_id: orderId,
+        copies: settings.copies ?? 1,
+        paper_width_mm: settings.paperWidthMm ?? 80,
+      },
+    });
+    if (errFn) throw errFn;
+    if (Array.isArray(data?.tickets) && data.tickets.length) tickets = data.tickets;
+    else throw new Error("la plataforma no devolvió ningún ticket");
+  } catch (e) {
+    console.error("No se pudo pedir el ticket a la plataforma:", e);
   }
 
-  // Cargar tenant + branch (para invoice_* config) en paralelo. La sede
-  // gana sobre el tenant para logo y datos legales — refleja el mismo
-  // comportamiento del módulo POS de invoicing en /admin.
-  const [{ data: tenant }, { data: branch }] = await Promise.all([
-    sb.from("tenants").select("name, whatsapp, logo_url").eq("id", order.tenant_id).maybeSingle(),
-    order.branch_id
-      ? sb.from("branches")
-          .select("legal_name, tax_id, logo_url, invoice_print_compact, invoice_print_logo, invoice_header_message, invoice_footer_message, invoice_qr_text")
-          .eq("id", order.branch_id)
-          .maybeSingle()
-      : Promise.resolve({ data: null }),
-  ]);
+  if (!tickets) {
+    /* Respaldo: se arma aquí con la plantilla vieja. Es peor —puede quedarse
+     * atrás en formato— pero mucho mejor que dejar a la cocina sin comanda si
+     * la plataforma no responde. Sale avisado en el registro. */
+    console.warn("Imprimiendo con la plantilla local (respaldo).");
+    const { data: order, error } = await sb
+      .from("orders")
+      .select("*, items:order_items(product_name, variant_name, quantity, unit_price, subtotal, toppings, notes)")
+      .eq("id", orderId)
+      .maybeSingle();
+    if (error || !order) {
+      console.error("Order fetch failed:", error);
+      return false;
+    }
+    const [{ data: tenant }, { data: branch }] = await Promise.all([
+      sb.from("tenants").select("name, whatsapp, logo_url").eq("id", order.tenant_id).maybeSingle(),
+      order.branch_id
+        ? sb.from("branches")
+            .select("name, phone, legal_name, tax_id, logo_url, invoice_print_compact, invoice_print_logo, invoice_header_message, invoice_footer_message, invoice_qr_text")
+            .eq("id", order.branch_id)
+            .maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
+    const preferredLogoUrl = (branch as any)?.logo_url || tenant?.logo_url || null;
+    const logoDataUrl = preferredLogoUrl ? await fetchLogoAsDataUrl(preferredLogoUrl) : null;
+    const qrDataUrl = (branch as any)?.invoice_qr_text
+      ? await generateQRDataUrl((branch as any).invoice_qr_text)
+      : null;
+    tickets = labelsForCopies(settings.copies ?? 1).map((copyLabel) =>
+      renderTicketHtml({
+        // El teléfono es el de LA SEDE; el del negocio queda de respaldo.
+        tenantName: (branch as any)?.name || tenant?.name || "Inami",
+        tenantPhone: (branch as any)?.phone || tenant?.whatsapp || "",
+        tenantLogo: logoDataUrl,
+        branch,
+        qrDataUrl,
+        order,
+        paperWidthMm: settings.paperWidthMm ?? 80,
+        copyLabel,
+      }),
+    );
+  }
 
-  // Logo: prefiero el de la sede sobre el del tenant. Lo cacheamos como
-  // data:URL para que funcione 100% offline en silent mode (sin parpadeo
-  // ni hotlink failure que arruine el ticket).
-  const preferredLogoUrl = branch?.logo_url || tenant?.logo_url || null;
-  const logoDataUrl = preferredLogoUrl ? await fetchLogoAsDataUrl(preferredLogoUrl) : null;
-
-  // QR opcional si la sede lo configuró
-  const qrDataUrl = branch?.invoice_qr_text ? await generateQRDataUrl(branch.invoice_qr_text) : null;
-
-  const copyLabels = labelsForCopies(settings.copies ?? 1);
-  /* Una impresión por copia, no un solo documento con page-break adentro.
-     Antes `renderTicketHtml` horneaba las N copias en un único HTML y se
-     llamaba a `print()` una vez — pero entonces había que darle a Chromium
-     un alto de página FIJO para las dos copias juntas, y "auto" no siempre
-     se respeta igual al imprimir a un printer físico que al exportar PDF.
-     Copia por copia, cada `print()` mide SU PROPIO contenido y le pide al
-     driver exactamente ese alto: ni corta lo que sobra de página ni deja
-     medio rollo de blanco. Ver la nota grande en `renderAndPrintNow`. */
+  /* Una impresión por copia, no un solo documento con page-break adentro: cada
+     `print()` mide SU PROPIO contenido y le pide al driver ese alto exacto. Ver
+     la nota grande en `renderAndPrintNow`. */
   let allOk = true;
-  for (const copyLabel of copyLabels) {
-    const html = renderTicketHtml({
-      tenantName: tenant?.name ?? "Inami",
-      tenantPhone: tenant?.whatsapp ?? "",
-      tenantLogo: logoDataUrl,
-      branch,
-      qrDataUrl,
-      order,
-      paperWidthMm: settings.paperWidthMm ?? 80,
-      copyLabel,
-    });
+  for (const html of tickets) {
     const ok = await renderAndPrint(html, settings.printerName!, settings.paperWidthMm ?? 80, settings.silentMode ?? true);
     if (!ok) allOk = false;
   }
