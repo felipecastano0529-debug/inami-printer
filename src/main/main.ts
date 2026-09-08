@@ -10,6 +10,8 @@
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, Notification, powerMonitor } from "electron";
 import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
 import Store from "electron-store";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const WebSocketImpl = require("ws");
@@ -574,7 +576,7 @@ async function processPrintJob(sb: any, job: any) {
       .update({
         status: ok ? "printed" : "failed",
         printed_at: ok ? new Date().toISOString() : null,
-        notes: ok ? "ok plugin" : "spooler rejected",
+        notes: ok ? "ok plugin" : "no se pudo imprimir (ver registro del plugin)",
       })
       .eq("id", job.id);
   } catch (e: any) {
@@ -896,8 +898,34 @@ async function renderAndPrintNow(html: string, printerName: string, paperWidthMm
     webPreferences: { offscreen: false, contextIsolation: true, nodeIntegration: false },
   });
 
+  /* El ticket se carga desde un ARCHIVO, no desde una `data:` URL.
+   *
+   * Iba como `data:text/html,<html codificado>`. Con el logo embebido en
+   * base64 esa URL pasa del millón de caracteres, y Chromium en Windows la
+   * corta: `loadURL` resuelve, la ventana queda EN BLANCO y se imprime igual.
+   * De ahí el rollo en blanco que salía en Tequendama —la primera sede en
+   * Windows; en macOS el mismo ticket entraba y por eso no se había visto—.
+   * Un archivo temporal no tiene ese techo. */
+  const archivo = path.join(
+    os.tmpdir(),
+    `inami-ticket-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.html`,
+  );
+
   try {
-    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    fs.writeFileSync(archivo, html, "utf8");
+    await win.loadFile(archivo);
+
+    /* Y se comprueba que de verdad haya algo escrito antes de gastar rollo.
+       Imprimir en blanco es peor que no imprimir: nadie se entera de que
+       falló, el pedido figura impreso y la comanda no llegó a la cocina. */
+    const contenido = await win.webContents
+      .executeJavaScript("(document.body && document.body.innerText || '').trim().length")
+      .catch(() => 0);
+    if (!contenido) {
+      console.error("El ticket se renderizó vacío: no se imprime.");
+      return false;
+    }
+
     // Espera a que TODAS las imágenes (logo) hayan terminado de cargar antes
     // de imprimir, sino el ticket sale sin logo en silent mode.
     try {
@@ -982,6 +1010,7 @@ async function renderAndPrintNow(html: string, printerName: string, paperWidthMm
     // cada fallo dejaba una ventana oculta viva hasta cerrar la app.
     setTimeout(() => {
       try { if (!win.isDestroyed()) win.destroy(); } catch {}
+      try { fs.unlinkSync(archivo); } catch {}
     }, 1500);
   }
 }
