@@ -1205,8 +1205,16 @@ function renderCopyPOS(args: {
     /* Lo que se QUITA sale aparte, en su propia línea y en mayúsculas. Con el
        "+N" de las adiciones, un "+1 Sin queso" se lee como si le hubieran
        AÑADIDO algo llamado «Sin queso» — y quien prepara sirve el plato
-       completo. Tampoco lleva valor: no se cobra por quitar. */
-    const quitar = adiciones.filter((a) => a.quitar);
+       completo. No lleva valor: no se cobra por quitar.
+
+       Salvo las que sí cuestan. «Queso aparte» sale de ese mismo grupo —quita
+       el queso del plato para servirlo en su propio recipiente— pero cobra los
+       $500 del empaque. Sin su renglón de precio, el ticket cobra algo que no
+       figura y el total no cuadra con la suma de lo impreso. Van en mayúsculas
+       como el resto de las quitas, para que quien empaca las vea, pero cada
+       una en su renglón y con su valor. */
+    const quitar = adiciones.filter((a) => a.quitar && a.price <= 0);
+    const quitarConPrecio = adiciones.filter((a) => a.quitar && a.price > 0);
     const suman = adiciones.filter((a) => !a.quitar);
 
     const subRows = [
@@ -1220,6 +1228,12 @@ function renderCopyPOS(args: {
             quitar.map((a) => a.name.toUpperCase()).join(", "),
           )} **</td></tr>`]
         : []),
+      ...quitarConPrecio.map((a) => {
+        const total = a.price * a.count * qty;
+        return `<tr class="ip-item-sub ip-item-quitar"><td class="ip-left">** ${escapeHtml(
+          a.name.toUpperCase(),
+        )} **</td><td class="ip-right">${num(total)}</td></tr>`;
+      }),
       ...(it.notes ? [`<tr class="ip-item-sub"><td class="ip-left" colspan="2">⚠ ${escapeHtml(it.notes)}</td></tr>`] : []),
     ].join("");
 
