@@ -797,8 +797,13 @@ async function printOrder(orderId: string): Promise<boolean> {
       : null;
     tickets = labelsForCopies(settings.copies ?? 1).map((copyLabel) =>
       renderTicketHtml({
-        // El teléfono es el de LA SEDE; el del negocio queda de respaldo.
-        tenantName: (branch as any)?.name || tenant?.name || "Inami",
+        // La cabecera lleva el nombre del NEGOCIO, no el de la sede: así lo
+        // conoce el cliente y la sede es cosa interna. Lo pidió el dueño con
+        // el papel en la mano —«que no diga Nueva Tequendama, que diga Inami
+        // Ice Cream Shop»— y así lo arma ya la plataforma en `ticket-html`;
+        // este respaldo se había quedado atrás y seguía sacando la sede.
+        // El teléfono sí es el de LA SEDE: es el que van a marcar.
+        tenantName: tenant?.name || "Inami",
         tenantPhone: (branch as any)?.phone || tenant?.whatsapp || "",
         tenantLogo: logoDataUrl,
         branch,
