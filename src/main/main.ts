@@ -30,7 +30,20 @@ interface SessionState {
   refreshToken?: string;
   tenantId?: string;
   tenantName?: string;
+  /* La sede de ESTA impresora. Sin ella, la máquina del mostrador de una sede
+     imprime también las comandas de las otras: hasta hoy solo se filtraba por
+     restaurante. No se nota mientras una sola sede tenga pedidos, y se nota
+     mucho el día que arrancan las tres. `undefined` = todas, que es lo que
+     quiere un negocio de una sola sede. */
+  branchId?: string;
+  branchName?: string;
   userEmail?: string;
+}
+
+/** ¿Esta comanda es de la sede que atiende esta impresora? */
+function esDeMiSede(branchId: string | null | undefined): boolean {
+  const mia = store.get("session")?.branchId;
+  return !mia || !branchId || branchId === mia;
 }
 
 interface OfflineState {
@@ -385,6 +398,7 @@ async function startRealtime() {
       async (payload: any) => {
         const order = payload.new;
         if (!order) return;
+        if (!esDeMiSede(order.branch_id)) return;
         if (alreadyPrinted(order.id) || inFlight.has(order.id)) return;
         if (order.status === "cancelled") return;
         // Pago en línea sin confirmar: se ignora. Lo imprime el UPDATE de
@@ -436,6 +450,7 @@ async function startRealtime() {
       async (payload: any) => {
         const job = payload.new;
         if (!job || job.status !== "pending") return;
+        if (!esDeMiSede(job.branch_id)) return;
         await processPrintJob(sb, job);
       },
     )
@@ -478,7 +493,7 @@ async function catchUpMissedOrders(sb: any) {
   const since = off.lastSeenAt ?? new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data, error } = await sb
     .from("orders")
-    .select("id, created_at, status")
+    .select("id, created_at, status, branch_id")
     .eq("tenant_id", session.tenantId)
     .eq("pago_pendiente", false)
     .gt("created_at", since)
@@ -488,7 +503,9 @@ async function catchUpMissedOrders(sb: any) {
   if (error) {
     console.error("Catch-up query failed:", error.message);
   } else {
-    const pending = (data ?? []).filter((o: any) => !alreadyPrinted(o.id) && !inFlight.has(o.id));
+    const pending = (data ?? []).filter(
+      (o: any) => esDeMiSede(o.branch_id) && !alreadyPrinted(o.id) && !inFlight.has(o.id),
+    );
     if (pending.length > 0) {
       console.log(`Catch-up: ${pending.length} pedido(s) pendiente(s)`);
       for (const o of pending) {
@@ -517,6 +534,7 @@ async function catchUpMissedOrders(sb: any) {
     return;
   }
   for (const job of jobs ?? []) {
+    if (!esDeMiSede(job.branch_id)) continue;
     await processPrintJob(sb, job);
   }
 }

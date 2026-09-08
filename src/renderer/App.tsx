@@ -21,6 +21,7 @@ declare global {
 }
 
 interface Tenant { id: string; name: string; }
+interface Sede { id: string; name: string; }
 
 export default function App() {
   const [config, setConfig] = useState<{ url: string; anonKey: string } | null>(null);
@@ -28,6 +29,7 @@ export default function App() {
   const [settings, setSettings] = useState<any>(null);
   const [printers, setPrinters] = useState<any[]>([]);
   const [tenants, setTenants] = useState<Tenant[]>([]);
+  const [sedes, setSedes] = useState<Sede[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Error de la carga de restaurantes, separado del de login: antes se tragaba
@@ -51,6 +53,9 @@ export default function App() {
         setError("Tu sesión expiró. Vuelve a iniciar sesión para seguir imprimiendo.");
       } else if (state.ok && state.session?.accessToken && cfg) {
         await loadTenants(cfg, state.session.accessToken);
+        if (state.session.tenantId) {
+          await loadSedes(state.session.tenantId, cfg, state.session.accessToken);
+        }
       }
       setLoading(false);
     })();
@@ -132,6 +137,35 @@ export default function App() {
     const newSession = { ...session, tenantId: t.id, tenantName: t.name };
     const ses = await window.api.setSession(newSession);
     setSession(ses);
+    await loadSedes(t.id);
+  }
+
+  /* Las sedes del restaurante. Si hay más de una hay que preguntar cuál
+     atiende esta impresora: si no, la máquina del mostrador de una sede
+     escupe también las comandas de las otras. */
+  async function loadSedes(
+    tenantId: string,
+    cfg = config,
+    token = session?.accessToken,
+  ) {
+    if (!cfg || !token) return;
+    try {
+      const sb = createClient(cfg.url, cfg.anonKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: `Bearer ${token}` } },
+      });
+      const { data } = await sb
+        .from("branches").select("id, name")
+        .eq("tenant_id", tenantId).eq("is_active", true).order("name");
+      setSedes((data as Sede[]) ?? []);
+    } catch { setSedes([]); }
+  }
+
+  async function handlePickSede(b: Sede | null) {
+    const ses = await window.api.setSession({
+      ...session, branchId: b?.id, branchName: b?.name,
+    });
+    setSession(ses);
   }
 
   // Volver al selector sin cerrar sesión — elegir mal el restaurante era
@@ -203,6 +237,31 @@ export default function App() {
     );
   }
 
+  // ─── Restaurante elegido pero sin sede, y hay más de una ───
+  // Va antes de la pantalla de impresora a propósito: elegirla después, entre
+  // los ajustes, es elegirla cuando ya se imprimió lo que no era.
+  if (sedes.length > 1 && !session.branchId) {
+    return (
+      <div style={{ padding: 8 }}>
+        <Header userEmail={session.userEmail} onLogout={handleLogout} />
+        <h2 style={{ marginTop: 24, marginBottom: 12 }}>¿Qué sede atiende esta impresora?</h2>
+        <p style={panelMuted}>
+          Solo va a imprimir las comandas de la sede que elijas. Se puede cambiar después.
+        </p>
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {sedes.map((b) => (
+            <button key={b.id} onClick={() => handlePickSede(b)} style={btnPrimary}>
+              {b.name}
+            </button>
+          ))}
+          <button onClick={() => handlePickSede(null)} style={btnGlass}>
+            Todas las sedes
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // ─── Configuración impresora + estado ───
   return (
     <div style={{ padding: 8 }}>
@@ -218,6 +277,20 @@ export default function App() {
             </button>
           </span>
         </Row>
+        {sedes.length > 1 && (
+          <Row>
+            <Label>Sede</Label>
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <strong>{session.branchName ?? "Todas"}</strong>
+              <button
+                onClick={() => { void handlePickSede(null); }}
+                style={{ ...btnGlass, padding: "4px 8px", fontSize: 12 }}
+              >
+                Cambiar
+              </button>
+            </span>
+          </Row>
+        )}
         <Row>
           <Label>Estado</Label>
           <span style={{ color: settings?.printerName ? "var(--success)" : "var(--warning)" }}>
