@@ -325,10 +325,17 @@ function handleSessionExpired(reason?: string) {
   realtimeStatus = "DISCONNECTED";
   refreshTrayMenu();
 
+  // El caso "otro inicio de sesión" es distinto de un token que vence solo:
+  // avisarlo tal cual ahorra la llamada de "la impresora no sirve" — el
+  // arreglo no es reinstalar, es que alguien deje de entrar a esta cuenta
+  // desde otro sitio (el panel en un navegador, una segunda instalación).
+  const otroLogin = /otro inicio de sesión/i.test(reason ?? "");
   try {
     new Notification({
       title: "Inami Printer — sesión expirada",
-      body: "Dejó de imprimir. Abre el plugin y vuelve a iniciar sesión.",
+      body: otroLogin
+        ? "Dejó de imprimir: alguien inició sesión con esta misma cuenta desde otro sitio. Abre el plugin, vuelve a iniciar sesión, y que nadie más use esta cuenta."
+        : "Dejó de imprimir. Abre el plugin y vuelve a iniciar sesión.",
       urgency: "critical",
     }).show();
   } catch { /* algunas distros no tienen notificaciones */ }
@@ -336,7 +343,14 @@ function handleSessionExpired(reason?: string) {
   openConfigWindow();
 }
 
-// Refresca el access_token cada 50 minutos (los tokens viven 1h por default).
+// Refresca el access_token cada 20 minutos (los tokens viven 1h por default).
+//
+// Antes eran 50: con un solo intento por hora, un fallo transitorio (la
+// conexión se cae justo en ese segundo) dejaba al plugin corriendo con un
+// access_token que iba a vencer en los siguientes 10 minutos, y el próximo
+// intento de arreglarlo era una hora después. Con tres intentos por hora en
+// vez de uno, un tropezón de red se resuelve solo antes de que el token
+// llegue a expirar.
 function startRefreshLoop() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(async () => {
@@ -351,9 +365,21 @@ function startRefreshLoop() {
         // Antes esto solo se logueaba y el plugin seguía "verde" en el tray
         // sin poder consultar nada. Si el token está revocado no hay reintento
         // que valga: hay que avisar y pedir login.
-        const dead = /invalid|revoked|not found|expired/i.test(error?.message ?? "");
+        //
+        // "Refresh Token Not Found"/"Already Used" es el caso concreto que
+        // pasó en producción: OTRO cliente logueado con la MISMA cuenta
+        // (el panel abierto en un navegador con esa cuenta, o una segunda
+        // instalación del plugin) rotó el token primero. Sigue siendo mortal
+        // — no hay con qué reintentar — pero ahora se explica en el aviso.
+        const dead = /invalid|revoked|not found|expired|already used/i.test(error?.message ?? "");
         console.error("Token refresh failed:", error?.message);
-        if (dead) handleSessionExpired(error?.message);
+        if (dead) {
+          handleSessionExpired(
+            /not found|already used/i.test(error?.message ?? "")
+              ? "Otro inicio de sesión con esta misma cuenta usó el token primero"
+              : (error?.message ?? undefined),
+          );
+        }
         return;
       }
       store.set("session", {
@@ -366,7 +392,7 @@ function startRefreshLoop() {
     } catch (e) {
       console.error("Refresh loop error:", e);
     }
-  }, 50 * 60 * 1000);
+  }, 20 * 60 * 1000);
 }
 
 async function startRealtime() {

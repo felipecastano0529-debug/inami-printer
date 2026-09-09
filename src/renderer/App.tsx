@@ -117,7 +117,22 @@ export default function App() {
     if (!config) return;
     setError(null);
     try {
-      const sb = createClient(config.url, config.anonKey, { auth: { persistSession: false } });
+      /* `autoRefreshToken` va explícito en FALSE, como en los otros dos
+       * `createClient` de este archivo — y aquí es más grave que en esos: a
+       * este cliente nadie lo vuelve a tocar después de este `await`, así que
+       * ninguna referencia en el código lo deja ir. Pero su temporizador
+       * interno de auto-refresh SÍ sigue vivo — un timer con una referencia
+       * pendiente no se recolecta — y disparaba solo, cerca de una hora
+       * después de este login, usando el MISMO refresh_token que ya le había
+       * entregado a `main` por IPC. El primero de los dos que refrescara
+       * rotaba el token; el otro, minutos después, se encontraba con un
+       * refresh_token ya usado y la sesión se caía sin que nada en pantalla
+       * lo explicara — justo lo que dice el comentario de `session:ensure` en
+       * `main.ts`: "el renderer NO renueva tokens por su cuenta". Aquí
+       * renovaba igual, por el valor por defecto. */
+      const sb = createClient(config.url, config.anonKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
       const { data, error } = await sb.auth.signInWithPassword({ email, password });
       if (error) throw error;
       const newSession = {
