@@ -37,6 +37,9 @@ export default function App() {
   // en silencio y la app caía en una pantalla con "Restaurante —" sin salida.
   const [tenantsError, setTenantsError] = useState<string | null>(null);
   const [loadingTenants, setLoadingTenants] = useState(false);
+  // Sede que le corresponde a la cuenta con la que se acaba de entrar, en
+  // espera de que alguien confirme que es la que toca en ESTA computadora.
+  const [sedeSugerida, setSedeSugerida] = useState<Sede | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -205,12 +208,22 @@ export default function App() {
     return [];
   }
 
+  /* Antes esto llamaba a `handlePickSede` de una, sin preguntar: la cuenta
+   * dice la sede y se configuraba en silencio, sin que nadie viera ni un
+   * "vas a imprimir para Tequendama" en pantalla.
+   *
+   * Las dos cuentas están guardadas juntas en un correo del negocio, y en el
+   * mostrador a veces se entra con la que no es. Con el auto-pick silencioso
+   * eso no se nota: la impresora de una sede se pone a imprimir la comanda de
+   * la otra, y nadie se entera hasta que la cocina reclama un papel que no es
+   * suyo. Ahora se pide confirmar — mismo trato que ya tenía la cuenta del
+   * dueño, que sí preguntaba por tener más de una sede para elegir. */
   useEffect(() => {
     if (!session?.tenantId || session.branchId || !roles.length || !sedes.length) return;
     const mia = sedeDeLaCuenta(session.tenantId);
-    if (!mia) return;
+    if (!mia) { setSedeSugerida(null); return; }
     const b = sedes.find((x) => x.id === mia);
-    if (b) void handlePickSede(b);
+    setSedeSugerida(b ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roles, sedes, session?.tenantId, session?.branchId]);
 
@@ -286,6 +299,33 @@ export default function App() {
             </div>
           </>
         )}
+      </div>
+    );
+  }
+
+  // ─── La cuenta ya trae su sede, pero hay que confirmarla ───
+  // Antes esto se configuraba solo, sin preguntar. Las cuentas de sede están
+  // guardadas juntas en un correo del negocio y en el mostrador a veces se
+  // entra con la que no es — sin este freno, la impresora de una sede se
+  // ponía a imprimir en silencio las comandas de la otra.
+  if (!session.branchId && sedeSugerida) {
+    return (
+      <div style={{ padding: 8 }}>
+        <Header userEmail={session.userEmail} onLogout={handleLogout} />
+        <h2 style={{ marginTop: 24, marginBottom: 12 }}>¿Esta es la sede correcta?</h2>
+        <p style={panelMuted}>
+          La cuenta <strong>{session.userEmail}</strong> es de <strong>{sedeSugerida.name}</strong>.
+          Confirma solo si esta computadora está en esa sede — si entraste con la cuenta que no
+          era, cierra sesión y vuelve a entrar con la correcta.
+        </p>
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          <button onClick={() => handlePickSede(sedeSugerida)} style={btnPrimary}>
+            Sí, esta computadora es {sedeSugerida.name}
+          </button>
+          <button onClick={handleLogout} style={btnGlass}>
+            No — entrar con otra cuenta
+          </button>
+        </div>
       </div>
     );
   }
