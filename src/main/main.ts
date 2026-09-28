@@ -811,7 +811,7 @@ async function printOrder(orderId: string): Promise<boolean> {
       sb.from("tenants").select("name, whatsapp, logo_url").eq("id", order.tenant_id).maybeSingle(),
       order.branch_id
         ? sb.from("branches")
-            .select("name, phone, legal_name, tax_id, logo_url, invoice_print_compact, invoice_print_logo, invoice_header_message, invoice_footer_message, invoice_qr_text")
+            .select("name, phone, legal_name, tax_id, logo_url, invoice_print_compact, invoice_print_logo, invoice_header_message, invoice_footer_message, invoice_qr_text, ticket_letra_px, ticket_con_barrio")
             .eq("id", order.branch_id)
             .maybeSingle()
         : Promise.resolve({ data: null }),
@@ -1155,7 +1155,9 @@ function renderTicketHtml(args: {
   const nominalMm = paperWidthMm === 58 ? 58 : 80;
   const printableMm = anchoImprimibleMm(nominalMm);
   const compact = branch?.invoice_print_compact === true || nominalMm === 58;
-  const baseFont = compact ? 9 : 11;
+  /* La letra es por sede (Panel → branches.ticket_letra_px). Sede Norte la
+     pidió más grande el 2026-09-28; las otras siguen en 11 px. */
+  const baseFont = Number(branch?.ticket_letra_px) || (compact ? 9 : 11);
 
   const copyHtml = renderCopyPOS({
     tenantName, tenantPhone, tenantLogo, branch, qrDataUrl, order,
@@ -1395,7 +1397,7 @@ function renderCopyPOS(args: {
           <tr><td>Teléfono:</td><td class="ip-right">${escapeHtml(order.customer_phone || "------")}</td></tr>
           ${order.order_type === "pickup"
             ? `<tr><td colspan="2" class="ip-addr" style="text-align:center">** RECOGER EN PUNTO **<br>Código: <span style="font-size:1.5em;letter-spacing:.18em">${escapeHtml(order.pickup_code || "----")}</span></td></tr>`
-            : `${order.barrio ? `<tr><td>Barrio:</td><td class="ip-right"><strong>${escapeHtml(order.barrio)}</strong></td></tr>` : ""}<tr><td colspan="2" class="ip-addr">${escapeHtml(order.address || "")}${order.address_details ? "<br><span class='ip-muted'>" + escapeHtml(order.address_details) + "</span>" : ""}</td></tr>`}
+            : `${branch?.ticket_con_barrio && order.barrio ? `<tr><td>Barrio:</td><td class="ip-right"><strong>${escapeHtml(order.barrio)}</strong></td></tr>` : ""}<tr><td colspan="2" class="ip-addr">${escapeHtml(order.address || "")}${order.address_details ? "<br><span class='ip-muted'>" + escapeHtml(order.address_details) + "</span>" : ""}</td></tr>`}
         </tbody>
       </table>
 
