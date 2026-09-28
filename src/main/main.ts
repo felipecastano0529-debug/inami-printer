@@ -920,6 +920,7 @@ async function printTestTicket(): Promise<boolean> {
       customer_phone: "+57 300 000 0000",
       address: "Cra 0 # 0-0",
       address_details: "Apto Test",
+      barrio: "San Fernando",
       subtotal: 30000,
       delivery_fee: 5000,
       total: 35000,
@@ -1394,7 +1395,7 @@ function renderCopyPOS(args: {
           <tr><td>Teléfono:</td><td class="ip-right">${escapeHtml(order.customer_phone || "------")}</td></tr>
           ${order.order_type === "pickup"
             ? `<tr><td colspan="2" class="ip-addr" style="text-align:center">** RECOGER EN PUNTO **<br>Código: <span style="font-size:1.5em;letter-spacing:.18em">${escapeHtml(order.pickup_code || "----")}</span></td></tr>`
-            : `<tr><td colspan="2" class="ip-addr">${escapeHtml(order.address || "")}${order.address_details ? "<br><span class='ip-muted'>" + escapeHtml(order.address_details) + "</span>" : ""}</td></tr>`}
+            : `${order.barrio ? `<tr><td>Barrio:</td><td class="ip-right"><strong>${escapeHtml(order.barrio)}</strong></td></tr>` : ""}<tr><td colspan="2" class="ip-addr">${escapeHtml(order.address || "")}${order.address_details ? "<br><span class='ip-muted'>" + escapeHtml(order.address_details) + "</span>" : ""}</td></tr>`}
         </tbody>
       </table>
 
