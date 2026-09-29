@@ -595,8 +595,10 @@ async function processPrintJob(sb: any, job: any) {
       return;
     }
 
-    console.log(`Procesando print job ${job.id} → order ${job.order_id}`);
-    const ok = await printOrder(job.order_id);
+    console.log(`Procesando print job ${job.id} → ${job.order_id ? `order ${job.order_id}` : "documento"}`);
+    /* Un trabajo sin pedido trae el documento ya armado (el cierre del día,
+       por ejemplo): se imprime tal cual, igual que una comanda, sin diálogo. */
+    const ok = job.order_id ? await printOrder(job.order_id) : await printDocumento(sb, job.id);
     await sb
       .from("print_jobs")
       .update({
@@ -850,6 +852,20 @@ async function printOrder(orderId: string): Promise<boolean> {
     if (!ok) allOk = false;
   }
   return allOk;
+}
+
+/* Documento suelto de `print_jobs.documento_html` (reportes del panel). Se lee
+   de la base y no del payload del realtime, que puede llegar recortado si el
+   documento es grande. Una sola copia: es un reporte, no una comanda. */
+async function printDocumento(sb: any, jobId: string): Promise<boolean> {
+  const settings = store.get("settings");
+  if (!settings.printerName) return false;
+  const { data, error } = await sb.from("print_jobs").select("documento_html").eq("id", jobId).maybeSingle();
+  if (error || !data?.documento_html) {
+    console.error("Documento vacío o ilegible:", error);
+    return false;
+  }
+  return renderAndPrint(data.documento_html, settings.printerName, settings.paperWidthMm ?? 80, settings.silentMode ?? true);
 }
 
 // "TICKET" si es una sola copia; "COCINA"/"CLIENTE" si son dos —los dos
