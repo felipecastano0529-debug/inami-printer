@@ -153,6 +153,32 @@ export default function App() {
     }
   }
 
+  /* Entrar con la LLAVE de la caja (el mismo link con que se abre la Caja del
+   * punto). La función `acceso-con-llave` abre una cuenta de cajero amarrada a
+   * la sede de esa llave; el plugin entra con ella y, como la cuenta ya trae su
+   * sede, la impresora queda fija ahí: solo imprime lo de esa caja. */
+  async function handleLlave(texto: string) {
+    if (!config) return;
+    setError(null);
+    const t = texto.trim();
+    let llave = t;
+    try { llave = new URL(t).searchParams.get("llave") || t; } catch { /* pegaron solo la llave */ }
+    const m = llave.match(/[?&]llave=([A-Za-z0-9_-]+)/);
+    if (m) llave = m[1];
+    try {
+      const r = await fetch(`${config.url}/functions/v1/acceso-con-llave`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", apikey: config.anonKey, Authorization: `Bearer ${config.anonKey}` },
+        body: JSON.stringify({ llave }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d?.email) throw new Error(d?.error || "Esa llave no sirve.");
+      await handleLogin(d.email, d.password);
+    } catch (e: any) {
+      setError(e?.message ?? "No se pudo entrar con la llave");
+    }
+  }
+
   async function handlePickTenant(t: Tenant) {
     const newSession = { ...session, tenantId: t.id, tenantName: t.name };
     const ses = await window.api.setSession(newSession);
@@ -260,7 +286,7 @@ export default function App() {
 
   // ─── Login ───
   if (!session?.accessToken) {
-    return <Login onLogin={handleLogin} error={error} />;
+    return <Login onLogin={handleLogin} onLlave={handleLlave} error={error} />;
   }
 
   // ─── Sin restaurante elegido ───
@@ -483,9 +509,34 @@ export default function App() {
 }
 
 // ─── UI helpers ───
-function Login({ onLogin, error }: { onLogin: (email: string, password: string) => void; error: string | null }) {
+function Login({ onLogin, onLlave, error }: { onLogin: (email: string, password: string) => void; onLlave: (texto: string) => void; error: string | null }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [conLlave, setConLlave] = useState(false);
+  const [llave, setLlave] = useState("");
+  if (conLlave) return (
+    <div style={{ padding: 32, textAlign: "center" }}>
+      <div style={{ fontSize: 32 }}>🖨️</div>
+      <h1 style={{ margin: "12px 0" }}>Impresora de la caja</h1>
+      <p style={panelMuted}>Pega el link con que abres la Caja del punto</p>
+      <form
+        onSubmit={(e) => { e.preventDefault(); onLlave(llave); }}
+        style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 24 }}
+      >
+        <input
+          placeholder="https://inamiicecreamshop.com/app?llave=…"
+          value={llave}
+          onChange={(e) => setLlave(e.target.value)}
+          required
+          autoFocus
+          style={inputStyle}
+        />
+        {error && <div style={{ color: "var(--danger)", fontSize: 13 }}>{error}</div>}
+        <button type="submit" style={btnPrimary}>Entrar</button>
+        <button type="button" onClick={() => setConLlave(false)} style={btnGlass}>Entrar con correo y contraseña</button>
+      </form>
+    </div>
+  );
   return (
     <div style={{ padding: 32, textAlign: "center" }}>
       <div style={{ fontSize: 32 }}>🖨️</div>
@@ -514,6 +565,7 @@ function Login({ onLogin, error }: { onLogin: (email: string, password: string) 
         />
         {error && <div style={{ color: "var(--danger)", fontSize: 13 }}>{error}</div>}
         <button type="submit" style={btnPrimary}>Entrar</button>
+        <button type="button" onClick={() => setConLlave(true)} style={btnGlass}>Entrar con la llave de la caja</button>
       </form>
     </div>
   );
